@@ -128,6 +128,18 @@ def _transparency_enabled():
         return None
 
 
+def _system_light():
+    """系统当前是不是亮色主题（SystemUsesLightTheme=1）。读不到时默认亮色。"""
+    try:
+        import winreg
+        path = (r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as k:
+            v, _ = winreg.QueryValueEx(k, "SystemUsesLightTheme")
+        return int(v) == 1
+    except Exception:
+        return True
+
+
 class PanelWin(object):
     """接口与 panel_core.PanelCore 保持一致，UI 层无感知换后端。"""
 
@@ -201,14 +213,21 @@ class PanelWin(object):
         alpha = self.get_alpha()
         if self.glass_on():
             state = ACCENT_ENABLE_ACRYLICBLURBEHIND
-            a = int(round(max(0.02, min(1.0, alpha)) * 255))
         else:
             # 关掉玻璃质感：只留模糊（仍半透明，但没有亚克力颗粒感）
             state = ACCENT_ENABLE_BLURBEHIND
-            a = int(round(max(0.02, min(1.0, alpha)) * 255))
 
-        # 色调：深色 #1A1A1A + alpha
-        tint = (a << 24) | 0x001A1A1A
+        # 色调：跟随系统亮/暗主题。
+        # Win11 (10.0.26200) 实测：亚克力模式下 GradientColor 直接当任务栏底色，
+        # 写死深色 0x1A1A1A 会把亮色主题的任务栏压成近黑；改成浅色才透亮。
+        # GradientColor 是 AABBGGRR，最高字节是色调不透明度。
+        # 浅色主题用白色系，深色主题用深灰系，alpha 越低越接近系统原生磨砂。
+        a = int(round(max(0.02, min(1.0, alpha)) * 255))
+        if _system_light():
+            rgb = 0x00FFFFFF           # 白（AABBGGRR 低位 RRGGBB=FFFFFF）
+        else:
+            rgb = 0x001A1A1A           # 深灰（暗色主题下才用深色）
+        tint = (a << 24) | rgb
         ok_any = False
         err = ""
         for h in hwnds:
