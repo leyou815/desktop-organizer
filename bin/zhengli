@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# 桌面整理 启动器
+set -e
+SELF="$(readlink -f "$0")"
+DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+exec "$PY" "$DIR/app/cli.py" "$@"

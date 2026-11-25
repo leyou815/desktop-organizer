@@ -1,0 +1,1260 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+桌面整理 —— 抽屉界面
+
+屏幕右侧一根不起眼的小竖条，点一下往左滑出抽屉：
+分类文件夹 + 文件列表 + 一键整理 / 撤销。再点把手（或 ESC / 点别处）收起。
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from PyQt5.QtCore import (Qt, QRectF, QTimer, QPropertyAnimation, QEasingCurve,
+                          pyqtSignal, QObject, QUrl, QPoint, QFileSystemWatcher,
+                          QEvent, QFileInfo)
+from PyQt5.QtGui import (QColor, QPainter, QPainterPath, QLinearGradient, QPen,
+                         QBrush, QFont, QFontMetrics, QIcon, QPixmap, QDesktopServices)
+from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QVBoxLayout,
+                             QHBoxLayout, QScrollArea, QFrame, QMessageBox,
+                             QSizePolicy, QGridLayout, QLineEdit,
+                             QFileIconProvider, QStyle, QDialog)
+from PyQt5.QtNetwork import QLocalServer, QLocalSocket
+
+import bulkops
+import config as appcfg
+import fuzzy
+import launchers
+import rules
+import sysenv
+from organizer import Organizer
+from theme import Palette, CAT_COLORS
+from ui_bulk import ConfirmDialog, MoveDialog, PromptDialog, RenameDialog
+
+
+# --------------------------------------------------------------------------- #
+# 右侧触发条
+# --------------------------------------------------------------------------- #
+class Trigger(QWidget):
+    """贴在屏幕右边缘的小竖条。平时半透明，鼠标移上去才亮。"""
+
+    clicked = pyqtSignal()
+
+    W, H = 11, 116
+
+    def __init__(self, pal):
+        super(Trigger, self).__init__(None, Qt.FramelessWindowHint |
+                                      Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.pal = pal
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(self.W, self.H)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("桌面抽屉")
+        self.setWindowOpacity(0.34)
+        self._hover = False
+        self.anim = QPropertyAnimation(self, b"windowOpacity", self)
+        self.anim.setDuration(160)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        # 画得比窗口宽，让右侧被屏幕边缘裁掉，只留下左侧圆角
+        r = QRectF(0, 0, self.W + 14, self.H)
+        path = QPainterPath()
+        path.addRoundedRect(r, 7, 7)
+
+        g = QLinearGradient(0, 0, 0, self.H)
+        base = self.pal.accent
+        g.setColorAt(0.0, QColor(base.red(), base.green(), base.blue(), 255 if self._hover else 210))
+        g.setColorAt(1.0, QColor(base.red(), base.green(), base.blue(), 200 if self._hover else 160))
+        p.fillPath(path, QBrush(g))
+
+        # 三个小点，提示"这里能拉开"
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 225))
+        cy = self.H / 2.0
+        for dy in (-9, 0, 9):
+            p.drawEllipse(QRectF(3.5, cy + dy - 1.6, 3.2, 3.2))
+        p.end()
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.anim.stop()
+        self.anim.setStartValue(self.windowOpacity())
+        self.anim.setEndValue(0.92)
+        self.anim.start()
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.anim.stop()
+        self.anim.setStartValue(self.windowOpacity())
+        self.anim.setEndValue(0.34)
+        self.anim.start()
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
+
+
+# --------------------------------------------------------------------------- #
+# 分类行
+# --------------------------------------------------------------------------- #
+class FileRow(QWidget):
+    """一个文件（或子文件夹）条目，点击打开。"""
+
+    def __init__(self, pal, name, path, is_dir=False, count=0):
+        super(FileRow, self).__init__()
+        self.pal = pal
+        self.name = name
+        self.path = path
+        self.is_dir = is_dir
+        self.count = count
+        self.setFixedHeight(26)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(path)
+        self._hover = False
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.path))
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0, 1, 0, -1)
+        if self._hover:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(self.pal.accent.red(), self.pal.accent.green(),
+                              self.pal.accent.blue(), 38))
+            p.drawRoundedRect(r, 5, 5)
+
+        # 小方块图标
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 40) if self.pal.dark else QColor(0, 0, 0, 26))
+        p.drawRoundedRect(QRectF(8, 9, 7, 8), 2, 2)
+
+        fm = QFontMetrics(self.font())
+        avail = self.width() - 34
+        if self.is_dir:
+            tail = "  %d" % self.count if self.count else "  空"
+        else:
+            tail = ""
+        text = fm.elidedText(self.name, Qt.ElideMiddle, avail - fm.width(tail))
+        p.setPen(QPen(self.pal.text))
+        p.drawText(QRectF(22, 0, avail, self.height()), Qt.AlignVCenter | Qt.AlignLeft, text)
+        if tail:
+            p.setPen(QPen(self.pal.muted))
+            p.drawText(QRectF(22, 0, avail, self.height()),
+                       Qt.AlignVCenter | Qt.AlignRight, tail)
+        p.end()
+
+
+_ICON_PROVIDER = None
+
+
+def load_icon(spec=None, path=None):
+    """取图标。Windows 用系统外壳图标（.lnk/.exe 的真实图标），麒麟用 Icon 字段。"""
+    global _ICON_PROVIDER
+    if sysenv.IS_WINDOWS and path:
+        if _ICON_PROVIDER is None:
+            _ICON_PROVIDER = QFileIconProvider()
+        try:
+            ic = _ICON_PROVIDER.icon(QFileInfo(path))
+            if not ic.isNull():
+                return ic
+        except Exception:
+            pass
+    if spec:
+        if os.path.isabs(spec) and os.path.exists(spec):
+            ic = QIcon(spec)
+            if not ic.isNull():
+                return ic
+        ic = QIcon.fromTheme(spec)
+        if not ic.isNull():
+            return ic
+    return QIcon.fromTheme("application-x-executable")
+
+
+_STD_ICONS = {
+    "此电脑": QStyle.SP_DriveHDIcon, "计算机": QStyle.SP_ComputerIcon,
+    "回收站": QStyle.SP_TrashIcon,
+    "用户文件夹": QStyle.SP_DirHomeIcon, "主目录": QStyle.SP_DirHomeIcon,
+}
+
+
+def virtual_icon(name, theme):
+    if theme:
+        ic = QIcon.fromTheme(theme)
+        if not ic.isNull():
+            return ic
+    std = _STD_ICONS.get(name)
+    if std is not None:
+        try:
+            return QApplication.style().standardIcon(std)
+        except Exception:
+            pass
+    return QIcon.fromTheme("folder")
+
+
+def _wrap2(text, fm, width):
+    """把名字折成最多两行，超出用省略号。
+
+    有空格时按词折（不然 Google Chrome 会被切成 "Google Chrom / e"），
+    中文没空格再按字折。
+    """
+    if fm.width(text) <= width:
+        return [text]
+
+    words = text.split(" ")
+    if len(words) > 1:
+        line1, i = "", 0
+        while i < len(words) and fm.width((line1 + " " + words[i]).strip()) <= width:
+            line1 = (line1 + " " + words[i]).strip()
+            i += 1
+        if line1:
+            if i >= len(words):
+                return [line1]
+            rest = " ".join(words[i:])
+            return [line1, fm.elidedText(rest, Qt.ElideRight, width)]
+
+    lines, cur = [], ""
+    for ch in text:
+        if fm.width(cur + ch) > width:
+            lines.append(cur)
+            cur = ch
+            if len(lines) == 2:
+                lines[-1] = fm.elidedText(lines[-1] + ch, Qt.ElideRight, width)
+                return lines
+        else:
+            cur += ch
+    if cur:
+        lines.append(cur)
+    return lines[:2]
+
+
+class AppTile(QWidget):
+    """抽屉里的一个图标：上面图标、下面名字，点一下就启动。"""
+
+    W, H = 82, 86
+
+    def __init__(self, pal, name, icon, on_click, tooltip=""):
+        super(AppTile, self).__init__()
+        self.pal = pal
+        self.name = name
+        self.on_click = on_click
+        self.setFixedSize(self.W, self.H)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(tooltip or name)
+        self._hover = False
+        self.pix = icon.pixmap(38, 38)
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.on_click:
+            self.on_click()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        if self._hover:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(self.pal.accent.red(), self.pal.accent.green(),
+                              self.pal.accent.blue(), 36))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 8, 8)
+
+        x = (self.width() - 38) / 2.0
+        p.drawPixmap(int(x), 8, self.pix)
+
+        f = self.font()
+        f.setPointSizeF(8.2)
+        p.setFont(f)
+        p.setPen(QPen(self.pal.text))
+        fm = QFontMetrics(f)
+        lines = _wrap2(self.name, fm, self.width() - 8)
+        y = 52
+        for line in lines:
+            p.drawText(QRectF(4, y, self.width() - 8, 14),
+                       Qt.AlignHCenter | Qt.AlignTop, line)
+            y += 14
+        p.end()
+
+
+_ICON_CACHE = {}
+_NAME_CACHE = {}
+
+
+def display_name(path, name, cat):
+    """应用要用 .desktop 里的中文名（微信），而不是文件名（wechat.desktop）。"""
+    if cat != rules.APP or not name.lower().endswith(".desktop"):
+        return name
+    if path in _NAME_CACHE:
+        return _NAME_CACHE[path]
+    try:
+        dn = launchers.parse(path).name or name
+    except Exception:
+        dn = name
+    _NAME_CACHE[path] = dn
+    return dn
+
+
+def entry_icon(path, cat, is_dir):
+    """搜索结果用的小图标（带缓存，18 个应用每次按键都要取，不缓存会卡）。"""
+    key = (path, cat, is_dir)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    if cat == rules.APP:
+        ic = load_icon(launchers.parse(path).icon, path)
+    elif is_dir:
+        ic = QIcon.fromTheme("folder")
+    else:
+        ic = QIcon.fromTheme("text-x-generic")
+    if ic.isNull():
+        ic = QIcon.fromTheme("text-x-generic")
+    _ICON_CACHE[key] = ic
+    return ic
+
+
+class ResultRow(QWidget):
+    """一条搜索结果：勾选框 + 图标 + 高亮文件名 + 分类标签。
+
+    点左边的勾选框是"选中"，点其它地方是"打开"——和文件管理器一致，
+    既不会误开文件，也不至于为了勾选去瞄一个 16px 的小方块。
+    """
+
+    CHECK_ZONE = 30          # 这个宽度以内算点勾选框
+    ICON_X = 32
+    TEXT_X = 54
+
+    def __init__(self, pal, name, path, cat, is_dir, indices, on_open, tag=None,
+                 on_check=None):
+        super(ResultRow, self).__init__()
+        self.pal = pal
+        self.name = name
+        self.path = path
+        self.cat = cat
+        self.tag = tag or cat
+        self.is_dir = is_dir
+        self.indices = set(indices or [])
+        self.on_open = on_open
+        self.on_check = on_check
+        self.checked = False
+        self.selected = False
+        self._hover = False
+        self.setFixedHeight(36)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("%s\n点左边勾选，点名字打开" % path)
+        self.pix = entry_icon(path, cat, is_dir).pixmap(18, 18)
+
+    def set_selected(self, on):
+        self.selected = on
+        self.update()
+
+    def set_checked(self, on):
+        if self.checked != on:
+            self.checked = on
+            self.update()
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return
+        if e.x() <= self.CHECK_ZONE or (e.modifiers() & Qt.ControlModifier):
+            if self.on_check:
+                self.on_check(self, e.modifiers())
+            return
+        self.on_open()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self.selected or self._hover or self.checked:
+            p.setPen(Qt.NoPen)
+            alpha = 52 if self.selected else (34 if self.checked else 30)
+            p.setBrush(QColor(self.pal.accent.red(), self.pal.accent.green(),
+                              self.pal.accent.blue(), alpha))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 7, 7)
+
+        # 勾选框
+        box = QRectF(9, (self.height() - 16) / 2.0, 16, 16)
+        if self.checked:
+            p.setPen(Qt.NoPen)
+            p.setBrush(self.pal.accent)
+            p.drawRoundedRect(box, 4.5, 4.5)
+            pen = QPen(QColor(255, 255, 255), 1.9)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            p.drawLine(QPoint(int(box.left() + 4), int(box.center().y())),
+                       QPoint(int(box.left() + 7), int(box.bottom() - 5)))
+            p.drawLine(QPoint(int(box.left() + 7), int(box.bottom() - 5)),
+                       QPoint(int(box.right() - 4), int(box.top() + 5)))
+        else:
+            p.setPen(QPen(QColor(self.pal.muted.red(), self.pal.muted.green(),
+                                 self.pal.muted.blue(), 150 if self._hover else 95), 1.4))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(box, 4.5, 4.5)
+
+        p.drawPixmap(self.ICON_X, 9, self.pix)
+
+        # 右侧分类标签
+        f = self.font()
+        f.setPointSizeF(f.pointSizeF() - 1.6)
+        p.setFont(f)
+        fm_tag = QFontMetrics(f)
+        tag = self.tag
+        tag_w = fm_tag.width(tag) + 4
+        p.setPen(QPen(self.pal.muted))
+        p.drawText(QRectF(self.width() - tag_w - 10, 0, tag_w, self.height()),
+                   Qt.AlignVCenter | Qt.AlignRight, tag)
+
+        # 文件名（逐字绘制以支持高亮）
+        f2 = self.font()
+        f2.setPointSizeF(f2.pointSizeF() - 0.3)
+        p.setFont(f2)
+        fm = QFontMetrics(f2)
+        avail = self.width() - self.TEXT_X - tag_w - 16
+        x, y = self.TEXT_X, (self.height() + fm.ascent() - fm.descent()) / 2.0
+        limit = self.TEXT_X + avail
+        for i, ch in enumerate(self.name):
+            w = fm.width(ch)
+            if x + w > limit:
+                p.setPen(QPen(self.pal.muted))
+                p.drawText(QRectF(x, 0, limit - x, self.height()),
+                           Qt.AlignVCenter | Qt.AlignLeft, "…")
+                break
+            p.setPen(QPen(self.pal.accent if i in self.indices else self.pal.text))
+            p.drawText(QRectF(x, 0, w + 1, self.height()), Qt.AlignVCenter | Qt.AlignLeft, ch)
+            x += w
+        p.end()
+
+
+class CatHeader(QWidget):
+    toggled = pyqtSignal()
+
+    def __init__(self, pal, cat, desc, count, expanded):
+        super(CatHeader, self).__init__()
+        self.pal = pal
+        self.cat = cat
+        self.desc = desc
+        self.count = count
+        self.expanded = expanded
+        self.setFixedHeight(50)
+        self.setCursor(Qt.PointingHandCursor)
+        self._hover = False
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.toggled.emit()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        if self._hover:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 18) if self.pal.dark else QColor(0, 0, 0, 12))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(2, 2, -2, -2), 8, 8)
+
+        # 颜色块
+        col = QColor(CAT_COLORS.get(self.cat, "#8A8F98"))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(col.red(), col.green(), col.blue(), 48))
+        p.drawRoundedRect(QRectF(10, 9, 32, 32), 9, 9)
+        p.setBrush(col)
+        p.drawRoundedRect(QRectF(19, 18, 14, 14), 4, 4)
+
+        # 标题 + 数量
+        p.setPen(QPen(self.pal.text))
+        f = self.font()
+        f.setPointSizeF(f.pointSizeF() + 0.5)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QRectF(52, 8, w - 90, 20), Qt.AlignVCenter | Qt.AlignLeft, self.cat)
+
+        f2 = self.font()
+        f2.setPointSizeF(f2.pointSizeF() - 1.5)
+        p.setFont(f2)
+        p.setPen(QPen(self.pal.muted))
+        p.drawText(QRectF(52, 26, w - 90, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                   "%d 个 · %s" % (self.count, self.desc))
+
+        # 展开箭头
+        p.setPen(QPen(self.pal.muted, 1.6))
+        cx, cy = w - 20.0, h / 2.0
+        if self.expanded:
+            p.drawLine(int(cx - 4), int(cy - 1), int(cx), int(cy + 4))
+            p.drawLine(int(cx), int(cy + 4), int(cx + 4), int(cy - 1))
+        else:
+            p.drawLine(int(cx - 4), int(cy - 4), int(cx + 1), int(cy))
+            p.drawLine(int(cx + 1), int(cy), int(cx - 4), int(cy + 4))
+        p.end()
+
+
+class CatRow(QWidget):
+    def __init__(self, pal, cat, desc, items, cfg=None):
+        super(CatRow, self).__init__()
+        self.pal = pal
+        self.cfg = cfg
+        self.cat = cat
+        self.items = items
+        self.expanded = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        n = rules.count_items(cat, items)
+        self.header = CatHeader(pal, cat, desc, n, False)
+        self.header.toggled.connect(self.toggle)
+        lay.addWidget(self.header)
+
+        self.body = QWidget()
+        self.body.setVisible(False)
+        self.bl = QVBoxLayout(self.body)
+        self.bl.setContentsMargins(14, 0, 12, 6)
+        self.bl.setSpacing(1)
+        self._filled = False
+        lay.addWidget(self.body)
+
+    def toggle(self):
+        self.expanded = not self.expanded
+        self.header.expanded = self.expanded
+        self.header.update()
+        if self.expanded and not self._filled:
+            self._fill()
+            self._filled = True
+        self.body.setVisible(self.expanded)
+
+    def _fill(self):
+        if self.cat in (rules.APP, rules.LINK):
+            self._fill_grid()
+            return
+        shown = 0
+        for name, path, is_dir, count in self.items:
+            if shown >= 40:
+                more = QLabel("…… 还有 %d 个" % (len(self.items) - shown))
+                more.setStyleSheet("color:%s;font-size:11px;padding-left:22px;"
+                                   % self.pal.muted.name())
+                self.bl.addWidget(more)
+                break
+            self.bl.addWidget(FileRow(self.pal, name, path, is_dir, count))
+            shown += 1
+        if not self.items:
+            empty = QLabel("暂无文件")
+            empty.setStyleSheet("color:%s;font-size:11px;padding-left:22px;"
+                                % self.pal.muted.name())
+            self.bl.addWidget(empty)
+
+
+# --------------------------------------------------------------------------- #
+# 抽屉面板
+# --------------------------------------------------------------------------- #
+    # -- 图标网格（应用 / 快捷方式） -----------------------------------------
+    def _fill_grid(self):
+        entries = []
+        try:
+            show_virtual = launchers.virtual_hidden()   # 藏了才在抽屉里补位，避免重复
+        except Exception:
+            show_virtual = False
+
+        if self.cat == rules.APP:
+            for name, path, is_dir, count in self.items:
+                lc = launchers.parse(path)
+                entries.append((lc.name, load_icon(lc.icon, path), path,
+                                lambda p=path: self._launch_app(p)))
+            if show_virtual:
+                for vname, uri, theme in launchers.VIRTUAL:
+                    entries.append((vname, virtual_icon(vname, theme), uri,
+                                    lambda u=uri: launchers.open_uri(u)))
+        else:
+            for name, path, is_dir, count in self.items:
+                ic = QIcon.fromTheme("folder-symbolic") if is_dir else \
+                     QIcon.fromTheme("inode-symlink")
+                if ic.isNull():
+                    ic = load_icon("folder")
+                entries.append((name.rstrip("/"), ic, path,
+                                lambda p=path: self._open_path(p)))
+
+        if not entries:
+            tip = QLabel("还没有已归档的%s" % self.cat)
+            tip.setStyleSheet("color:%s;font-size:11px;padding-left:22px;"
+                              % self.pal.muted.name())
+            self.bl.addWidget(tip)
+            return
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 2, 0, 4)
+        grid.setHorizontalSpacing(2)
+        grid.setVerticalSpacing(2)
+        for i, (name, icon, path, slot) in enumerate(entries):
+            grid.addWidget(AppTile(self.pal, name, icon, slot, path), i // 4, i % 4)
+        wrap = QWidget()
+        wrap.setLayout(grid)
+        self.bl.addWidget(wrap)
+
+    def _launch_app(self, path):
+        ok, err = launchers.launch(path)
+        if not ok:
+            self._notify("启动失败：%s" % err)
+
+    def _open_path(self, path):
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            self._notify("打不开：%s" % path)
+
+    def _notify(self, msg):
+        # 面板上给个轻提示，不弹窗
+        if self.window() and hasattr(self.window(), "_flash"):
+            self.window()._flash(msg)
+
+
+class Panel(QWidget):
+    WIDTH = 386
+
+    def __init__(self, org, pal, on_hide=None, on_show=None, cfg=None):
+        super(Panel, self).__init__(None, Qt.FramelessWindowHint |
+                                    Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.org = org
+        self.pal = pal
+        self.on_hide = on_hide
+        self.on_show = on_show
+        self.cfg = cfg
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedWidth(self.WIDTH)
+
+        # 批量操作（勾选后移动 / 重命名 / 删除）
+        self.ops = bulkops.BulkOps(org, cfg)
+        self._checked = []          # 按勾选顺序存的路径
+        self._anchor = None         # Shift 连选的起点
+        self._pending = []          # 最近一次批量操作的结果，用于提示
+
+        scr = QApplication.primaryScreen().availableGeometry()
+        self._top = scr.top() + 46
+        h = scr.height() - 92
+        self.setFixedHeight(h)
+        self._x_shown = scr.right() - self.WIDTH + 1   # 贴死屏幕右边缘，不留缝
+        self._x_hidden = scr.right() + 8
+        self.move(self._x_hidden, self._top)
+
+        self.is_open = False
+        self._anim = QPropertyAnimation(self, b"pos", self)
+        self._anim.setDuration(230)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(200)
+
+        self._build()
+        self.refresh()
+
+    # -- 结构 ---------------------------------------------------------------
+    def _build(self):
+        pal = self.pal
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 14, 14)
+        lay.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title_box = QVBoxLayout()
+        title_box.setSpacing(1)
+        t = QLabel("桌面抽屉")
+        t.setStyleSheet("color:%s;font-size:15px;font-weight:700;" % pal.text.name())
+        self.sub = QLabel("")
+        self.sub.setStyleSheet("color:%s;font-size:11px;" % pal.muted.name())
+        title_box.addWidget(t)
+        title_box.addWidget(self.sub)
+        head.addLayout(title_box)
+        head.addStretch(1)
+
+        self.btn_open = self._mini_btn("打开目录", self._open_root)
+        head.addWidget(self.btn_open)
+        head.addWidget(self._mini_btn("✕", self.slide_out))
+        lay.addLayout(head)
+
+        # 搜索框
+        self._query = ""
+        self._rows = []
+        self._sel = -1
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索文件名，或拼音首字母：wx / sls / 报告")
+        self.search.setClearButtonEnabled(True)
+        self.search.setFixedHeight(32)
+        self.search.setStyleSheet("""
+        QLineEdit{border:1px solid %s;border-radius:8px;background:%s;
+            color:%s;font-size:12px;padding-left:10px;padding-right:6px;}
+        QLineEdit:focus{border:1px solid %s;}
+        """ % (pal.line.name(), pal.card_hi.name(), pal.text.name(), pal.accent.name()))
+        self.search.addAction(QIcon.fromTheme("edit-find"), QLineEdit.LeadingPosition)
+        self.search.textChanged.connect(self._queue_search)
+        self.search.installEventFilter(self)
+        lay.addWidget(self.search)
+
+        self.hint = QLabel("")
+        self.hint.setStyleSheet("color:%s;font-size:10px;padding-left:4px;" % pal.muted.name())
+        self.hint.setVisible(False)
+        lay.addWidget(self.hint)
+
+        # 勾选后浮出来的操作条
+        self.opsbar = QFrame()
+        self.opsbar.setStyleSheet(
+            "QFrame{background:rgba(76,141,255,0.10);"
+            "border:1px solid rgba(76,141,255,0.30);border-radius:9px;}")
+        ol = QVBoxLayout(self.opsbar)
+        ol.setContentsMargins(9, 7, 9, 8)
+        ol.setSpacing(7)
+
+        top = QHBoxLayout()
+        top.setSpacing(4)
+        self.sel_lb = QLabel("")
+        self.sel_lb.setStyleSheet("color:%s;font-size:11px;font-weight:600;border:none;"
+                                  % pal.text.name())
+        top.addWidget(self.sel_lb, 1)
+        for text, slot in (("全选", self._select_all),
+                           ("反选", self._invert_sel),
+                           ("清空", self._clear_sel)):
+            b = QPushButton(text)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFlat(True)
+            b.setFixedHeight(20)
+            b.setStyleSheet(
+                "QPushButton{border:none;background:transparent;color:%s;font-size:10.5px;"
+                "padding:0 6px;border-radius:5px;}"
+                "QPushButton:hover{background:rgba(127,127,127,0.18);color:%s;}"
+                % (pal.accent.name(), pal.text.name()))
+            b.clicked.connect(slot)
+            top.addWidget(b)
+        ol.addLayout(top)
+
+        acts = QHBoxLayout()
+        acts.setSpacing(6)
+        self.btn_move = self._op_btn("移动到…", self._bulk_move, "搬进抽屉里别的分类，或新建文件夹")
+        self.btn_rename = self._op_btn("重命名", self._bulk_rename, "把文件名里的某个词统一换掉")
+        self.btn_trash = self._op_btn("删除", self._bulk_trash, "放进回收站，可从这里撤销",
+                                      danger=True)
+        for b in (self.btn_move, self.btn_rename, self.btn_trash):
+            acts.addWidget(b)
+        ol.addLayout(acts)
+
+        self.opsbar.setVisible(False)
+        lay.addWidget(self.opsbar)
+
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(120)
+        self._search_timer.timeout.connect(self._run_search)
+
+        # 待整理提示条
+        self.banner = QFrame()
+        self.banner.setStyleSheet(
+            "QFrame{background:rgba(76,141,255,0.12);border:1px solid rgba(76,141,255,0.35);"
+            "border-radius:8px;}")
+        bl = QHBoxLayout(self.banner)
+        bl.setContentsMargins(10, 7, 8, 7)
+        self.banner_lb = QLabel("")
+        self.banner_lb.setStyleSheet("color:%s;font-size:12px;border:none;" % pal.text.name())
+        bl.addWidget(self.banner_lb, 1)
+        self.btn_clean = QPushButton("一键整理")
+        self.btn_clean.setCursor(Qt.PointingHandCursor)
+        self.btn_clean.setFixedHeight(24)
+        self.btn_clean.setStyleSheet(
+            "QPushButton{border:none;border-radius:6px;background:%s;color:#FFF;"
+            "font-size:11px;padding:0 12px;font-weight:600;}"
+            "QPushButton:hover{background:%s;}"
+            % (pal.accent.name(), pal.accent.darker(115).name()))
+        self.btn_clean.clicked.connect(self.organize)
+        bl.addWidget(self.btn_clean)
+        self.banner.setVisible(False)
+        lay.addWidget(self.banner)
+
+        # 分类滚动区
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet(
+            "QScrollArea{background:transparent;border:none;}"
+            "QScrollBar:vertical{width:6px;background:transparent;margin:2px 0;}"
+            "QScrollBar::handle:vertical{background:rgba(140,146,156,0.45);border-radius:3px;"
+            "min-height:30px;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:none;}")
+        self.scroll.viewport().setAutoFillBackground(False)
+        self.body = QWidget()
+        self.body.setStyleSheet("background:transparent;")
+        self.bl = QVBoxLayout(self.body)
+        self.bl.setContentsMargins(0, 0, 4, 0)
+        self.bl.setSpacing(2)
+        self.scroll.setWidget(self.body)
+        lay.addWidget(self.scroll, 1)
+
+        # 底部
+        self.path_hint = QLabel("")
+        self.path_hint.setStyleSheet("color:%s;font-size:10px;" % pal.muted.name())
+        self.path_hint.setWordWrap(True)
+        lay.addWidget(self.path_hint)
+
+        foot = QHBoxLayout()
+        self.status = QLabel("")
+        self.status.setStyleSheet("color:%s;font-size:11px;" % pal.muted.name())
+        foot.addWidget(self.status, 1)
+        self.btn_undo = self._mini_btn("撤销上次", self.undo)
+        foot.addWidget(self.btn_undo)
+        lay.addLayout(foot)
+
+    def _mini_btn(self, text, slot):
+        b = QPushButton(text)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFlat(True)
+        b.setFixedHeight(24)
+        b.setStyleSheet(
+            "QPushButton{border:none;background:transparent;color:%s;font-size:11px;"
+            "padding:0 8px;border-radius:6px;}"
+            "QPushButton:hover{background:%s;color:%s;}"
+            % (self.pal.muted.name(), self.pal.card_hi.name(), self.pal.text.name()))
+        b.clicked.connect(slot)
+        return b
+
+    def _op_btn(self, text, slot, tip="", danger=False):
+        b = QPushButton(text)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFixedHeight(28)
+        b.setToolTip(tip)
+        if danger:
+            fg, hover_fg, hover_bg = "#D9534F", "#FFFFFF", "rgba(217,83,79,0.85)"
+        else:
+            fg, hover_fg, hover_bg = self.pal.text.name(), "#FFFFFF", self.pal.accent.name()
+        b.setStyleSheet(
+            "QPushButton{border:1px solid %s;border-radius:7px;background:%s;"
+            "color:%s;font-size:11.5px;padding:0 10px;}"
+            "QPushButton:hover{background:%s;color:%s;border:1px solid %s;}"
+            % (self.pal.line.name(), self.pal.card_hi.name(), fg,
+               hover_bg, hover_fg, hover_bg))
+        b.clicked.connect(slot)
+        return b
+
+    # -- 背景 ---------------------------------------------------------------
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        path = QPainterPath()
+        # 只圆左边两个角：向右多画 32px，右侧圆角落到窗口外被裁掉
+        path.addRoundedRect(QRectF(-16, 0, w + 32, h), 16, 16)
+        p.fillPath(path, QBrush(self.pal.card))
+        # 左边一条细高光
+        grad = QLinearGradient(0, 0, 3, 0)
+        grad.setColorAt(0, QColor(self.pal.accent.red(), self.pal.accent.green(),
+                                  self.pal.accent.blue(), 150))
+        grad.setColorAt(1, QColor(self.pal.accent.red(), self.pal.accent.green(),
+                                  self.pal.accent.blue(), 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawRect(QRectF(0, 18, 3, h - 36))
+        p.end()
+
+    # -- 搜索 ---------------------------------------------------------------
+    def _queue_search(self, text):
+        self._query = text.strip()
+        if not self._query:
+            # 清空搜索框等于放弃这轮勾选，免得"已选 3 项"悬在那儿没处看
+            self._checked = []
+            self._anchor = None
+        self._search_timer.start()
+
+    def _clear_body(self):
+        while self.bl.count():
+            item = self.bl.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    def _run_search(self):
+        q = self._query
+        if not q:
+            self.hint.setVisible(False)
+            self._rows = []
+            self._sel = -1
+            self.refresh()
+            return
+
+        base_root = self.org.root
+        rows = []
+        for (name, path, cat, is_dir) in self.org.index_entries():
+            shown = display_name(path, name, cat)
+            depth = os.path.relpath(path, os.path.join(base_root, cat)).count(os.sep)
+            tag = os.path.basename(os.path.dirname(path)) if depth else cat
+
+            best = fuzzy.match(q, shown)
+            idxs = list(best[1]) if best else []
+            if shown != name:
+                # 文件名也认（有人习惯搜 wechat）
+                r2 = fuzzy.match(q, name)
+                if r2 and (best is None or r2[0] - 40 > best[0]):
+                    best, idxs = r2, []
+            if not best:
+                continue
+            rows.append((best[0] - depth * 90, shown, path, cat, is_dir, idxs, tag))
+
+        rows.sort(key=lambda r: (-r[0], len(r[1]), r[1]))
+        rows = rows[:60]
+
+        self._clear_body()
+        self._rows = []
+        for _, shown, path, cat, is_dir, idxs, tag in rows:
+            row = ResultRow(self.pal, shown, path, cat, is_dir, idxs,
+                            lambda x=path, c=cat, d=is_dir: self._open_entry(x, c, d),
+                            tag=tag, on_check=self._on_row_check)
+            row.set_checked(path in self._checked)
+            self.bl.addWidget(row)
+            self._rows.append(row)
+        self.bl.addStretch(1)
+
+        if rows:
+            self.hint.setText("找到 %d 项（点左边勾选，↑↓ 选，回车打开）" % len(rows))
+            self._sel = 0
+            self._rows[0].set_selected(True)
+        else:
+            self.hint.setText("没有匹配的文件")
+            self._sel = -1
+        self.hint.setVisible(True)
+        self._refresh_opsbar()
+
+    def _move_sel(self, step):
+        if not self._rows:
+            return
+        self._rows[self._sel].set_selected(False) if 0 <= self._sel < len(self._rows) else None
+        self._sel = max(0, min(len(self._rows) - 1, self._sel + step))
+        self._rows[self._sel].set_selected(True)
+        self.scroll.ensureWidgetVisible(self._rows[self._sel], 0, 30)
+
+    def _open_sel(self):
+        if 0 <= self._sel < len(self._rows):
+            self._rows[self._sel].on_open()
+
+    def _open_entry(self, path, cat, is_dir):
+        if cat == rules.APP:
+            ok, err = launchers.launch(path)
+            if not ok:
+                self._flash("启动失败：%s" % err)
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            self._flash("打不开：%s" % path)
+
+    # -- 勾选 ---------------------------------------------------------------
+    def _on_row_check(self, row, mods):
+        """点勾选框：Shift 连选一段，其它情况切换单个。"""
+        if (mods & Qt.ShiftModifier) and self._anchor:
+            paths = [r.path for r in self._rows]
+            if self._anchor in paths and row.path in paths:
+                a, b = sorted((paths.index(self._anchor), paths.index(row.path)))
+                for r in self._rows[a:b + 1]:
+                    if r.path not in self._checked:
+                        self._checked.append(r.path)
+                    r.set_checked(True)
+                self._refresh_opsbar()
+                return
+
+        if row.path in self._checked:
+            self._checked.remove(row.path)
+            row.set_checked(False)
+        else:
+            self._checked.append(row.path)
+            row.set_checked(True)
+        self._anchor = row.path
+        self._refresh_opsbar()
+
+    def _select_all(self):
+        for r in self._rows:
+            if r.path not in self._checked:
+                self._checked.append(r.path)
+            r.set_checked(True)
+        self._refresh_opsbar()
+
+    def _invert_sel(self):
+        for r in self._rows:
+            if r.path in self._checked:
+                self._checked.remove(r.path)
+                r.set_checked(False)
+            else:
+                self._checked.append(r.path)
+                r.set_checked(True)
+        self._refresh_opsbar()
+
+    def _clear_sel(self):
+        self._checked = []
+        self._anchor = None
+        for r in self._rows:
+            r.set_checked(False)
+        self._refresh_opsbar()
+
+    def _refresh_opsbar(self):
+        """操作条的显隐和文案。
+
+        勾选是跨搜索保留的：搜「报告」勾三个，再搜「总结」勾两个，
+        一起删掉很顺手。所以这里要说明有几项不在当前结果里。
+        """
+        n = len(self._checked)
+        if not n:
+            self.opsbar.setVisible(False)
+            self.hint.setVisible(bool(self._query))
+            return
+        visible = sum(1 for r in self._rows if r.path in self._checked)
+        txt = "已选 %d 项" % n
+        if visible < n:
+            txt += "（其中 %d 项不在此结果里）" % (n - visible)
+        self.sel_lb.setText(txt)
+        self.opsbar.setVisible(True)
+        self.hint.setVisible(False)
+
+        people = [p for p in self._checked if os.path.exists(p)]
+        n_dir = len([p for p in people if os.path.isdir(p)])
+        tail = "（含 %d 个文件夹，会整包处理）" % n_dir if n_dir else ""
+        self.btn_move.setToolTip("搬进抽屉里别的分类，或新建一个文件夹" + tail)
+        self.btn_rename.setToolTip("把文件名里的某个词统一换掉" + tail)
+        self.btn_trash.setToolTip("放进回收站，可从这里撤销" + tail)
+
+    # -- 批量动作 -----------------------------------------------------------
+    def _bulk_paths(self):
+        paths = [p for p in self._checked if os.path.exists(p)]
+        if not paths:
+            self._flash("选中的项目已经不在了")
+            self._clear_sel()
+            self.refresh()
+        return paths
+
+    def _bulk_move(self):
+        paths = self._bulk_paths()
+        if not paths:
+            return
+        dlg = MoveDialog(self, self.pal, len(paths), self.ops.target_dirs(),
+                         os.path.dirname(paths[0]), self.ops)
+        dlg.center_on_parent()
+        if dlg.exec_() != QDialog.Accepted or not dlg.target:
+            return
+        done, failed = self.ops.move(paths, dlg.target)
+        self._checked = []
+        self._anchor = None
+        self.refresh()
+        msg = "已移动 %d 项到「%s」" % (len(done), os.path.basename(dlg.target))
+        if failed:
+            msg += "，%d 项没动（%s）" % (len(failed), failed[0][1])
+        self._flash(msg)
+
+    def _bulk_rename(self):
+        paths = self._bulk_paths()
+        if not paths:
+            return
+        dlg = RenameDialog(self, self.pal, paths, self.ops)
+        dlg.center_on_parent()
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        done, failed = self.ops.rename(paths, dlg.old.text(), dlg.new.text(),
+                                       include_ext=dlg.with_ext.isChecked())
+        self._checked = []          # 路径全变了，旧的勾选没意义了
+        self._anchor = None
+        self.refresh()
+        msg = "已改名 %d 项" % len(done)
+        if failed:
+            msg += "，%d 项跳过（%s）" % (len(failed), failed[0][1])
+        self._flash(msg)
+
+    def _bulk_trash(self):
+        paths = self._bulk_paths()
+        if not paths:
+            return
+        n_dir = len([p for p in paths if os.path.isdir(p)])
+        text = ("会放进系统回收站，不是永久删除。\n"
+                "删完点「撤销上次」就能拿回来。")
+        if n_dir:
+            text += "\n其中 %d 个是文件夹，会连同里面的内容一起进去。" % n_dir
+        dlg = ConfirmDialog(self, self.pal, "删除 %d 项？" % len(paths), text,
+                            ok_text="放进回收站")
+        dlg.center_on_parent()
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        done, failed = self.ops.trash(paths)
+        self._checked = []
+        self._anchor = None
+        self.refresh()
+        msg = "已把 %d 项放进回收站" % len(done)
+        if failed:
+            msg += "，%d 项没动（%s）" % (len(failed), failed[0][1])
+        self._flash(msg)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.search and ev.type() == QEvent.KeyPress:
+            k = ev.key()
+            if k == Qt.Key_Down:
+                self._move_sel(1); return True
+            if k == Qt.Key_Up:
+                self._move_sel(-1); return True
+            if k in (Qt.Key_Return, Qt.Key_Enter):
+                self._open_sel(); return True
+            if k == Qt.Key_Escape:
+                if self.search.text():
+                    self.search.clear()
+                else:
+                    self.slide_out()
+                return True
+        return super(Panel, self).eventFilter(obj, ev)
+
+    # -- 数据 ---------------------------------------------------------------
+    def refresh(self):
+        data = self.org.summary()
+        total = sum(rules.count_items(c, data[c]) for c in data)
+        self.sub.setText("共归档 %d 项" % total)
+        self.path_hint.setText("归档位置：%s"
+                               % self.org.root.replace(os.path.expanduser("~"), "~"))
+
+        pend = self.org.pending_count()
+        if pend:
+            self.banner_lb.setText("桌面上还有 %d 项待归类" % pend)
+            self.banner.setVisible(True)
+        else:
+            self.banner.setVisible(False)
+
+        # 正在搜索时不要被分类列表覆盖，把搜索结果重跑一遍
+        if self._query:
+            self._run_search()
+            self._update_undo_btn()
+            return
+
+        self._rows = []
+        self.opsbar.setVisible(False)
+        self._clear_body()
+        for cat in rules.CATEGORY_ORDER:
+            row = CatRow(self.pal, cat, rules.CATEGORY_DESC.get(cat, ""),
+                         data.get(cat, []), cfg=self.cfg)
+            self.bl.addWidget(row)
+        self.bl.addStretch(1)
+        self._update_undo_btn()
+
+    def _update_undo_btn(self):
+        has = bool(self.org.last_batch_info()) or bool(self.ops.last_info())
+        self.btn_undo.setEnabled(has)
+        self.btn_undo.setStyleSheet(
+            "QPushButton{border:none;background:transparent;color:%s;font-size:11px;"
+            "padding:0 8px;border-radius:6px;}"
+            "QPushButton:hover{background:%s;color:%s;}"
+            % ((self.pal.muted.name() if has else self.pal.line.name()),
+               self.pal.card_hi.name(), self.pal.text.name()))
+
+    # -- 动作 ---------------------------------------------------------------
+    def organize(self):
+        try:
+            moved = self.org.apply()
+        except Exception as e:
+            self._flash("整理失败：%s" % e)
+            return
+        self.refresh()
+        self._flash("已归类 %d 项" % len(moved) if moved else "没有需要整理的")
+
+    def undo(self):
+        """撤销最近一次操作：一键整理和批量操作共用这个按钮，谁的更近撤谁。"""
+        n, msg = bulkops.undo_latest(self.org, self.ops, appcfg.LOG_FILE)
+        self.refresh()
+        self._flash(msg or "没有可撤销的记录")
+
+    def _open_root(self):
+        self.org.ensure_dirs()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self.org.root))
+
+    def _flash(self, msg):
+        self.status.setText(msg)
+        QTimer.singleShot(3200, lambda: self.status.setText(""))
+
+    # -- 滑动 ---------------------------------------------------------------
+    def slide_in(self):
+        if self.is_open:
+            return
+        self.refresh()
+        self.is_open = True
+        self.setWindowOpacity(0.0)
+        self.move(self._x_hidden, self._top)
+        self.show()
+        self.raise_()
+        try:
+            self.activateWindow()
+        except Exception:
+            pass
+        self._anim.stop()
+        self._anim.setStartValue(self.pos())
+        self._anim.setEndValue(QPoint(self._x_shown, self._top))
+        self._anim.start()
+        if self.on_show:
+            self.on_show()
+        self._fade.stop()
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.start()
+
+    def slide_out(self):
+        if not self.is_open and not self.isVisible():
+            return
+        self.is_open = False
+        self._anim.stop()
+        self._anim.setStartValue(self.pos())
+        self._anim.setEndValue(QPoint(self._x_hidden, self._top))
+        self._anim.start()
+        self._anim.finished.connect(self._after_out)
+
+    def _after_out(self):
+        try:
+            self._anim.finished.disconnect()
+        except TypeError:
+            pass
+        self.hide()
+        if self.on_hide:
+            self.on_hide()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.slide_out()
+        else:
+            super(Panel, self).keyPressEvent(e)
+
+    def changeEvent(self, e):
+        # 点到别处就收起，但拖动画期间不响应
+        if e.type() == e.ActivationChange and not self.isActiveWindow() \
+                and self.is_open and self._anim.state() != QPropertyAnimation.Running:
+            QTimer.singleShot(120, self._maybe_hide)
+        super(Panel, self).changeEvent(e)
+
+    def _maybe_hide(self):
+        if self.is_open and not self.isActiveWindow():
+            self.slide_out()
+
+
