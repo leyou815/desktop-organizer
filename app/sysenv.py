@@ -84,6 +84,27 @@ def _win_desktop_from_registry():
         return ""
 
 
+def desktop_dirs():
+    """所有要在桌面上整理的位置。
+
+    Windows 把「当前用户桌面」和「公共桌面」合并显示成一个桌面：
+    各软件装在公共桌面（C:\\Users\\Public\\Desktop）的快捷方式，用户看得见，
+    但只扫用户桌面就会漏掉。这里把两个都列出来，各自归档到同一个抽屉。
+    麒麟/Linux 只有一个桌面目录，返回单元素列表。
+    """
+    primary = desktop_dir()
+    out = [primary]
+    if IS_WINDOWS:
+        public = os.path.join(os.environ.get("PUBLIC") or
+                              os.path.join(os.path.expanduser("~").rsplit(os.sep, 1)[0],
+                                           "Public"), "Desktop")
+        if (os.path.isdir(public) and
+                os.path.normcase(os.path.abspath(public)) !=
+                os.path.normcase(os.path.abspath(primary))):
+            out.append(public)
+    return out
+
+
 def config_dir():
     if IS_WINDOWS:
         base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData",

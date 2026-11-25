@@ -499,8 +499,10 @@ class App(QObject):
     # ---------------------------------------------------------------- 监听
     def _build_watcher(self):
         w = QFileSystemWatcher(self)
-        if os.path.isdir(self.org.desktop):
-            w.addPath(self.org.desktop)
+        # Windows 公共桌面和用户桌面合并显示，两个都要监听
+        for d in sysenv.desktop_dirs():
+            if os.path.isdir(d):
+                w.addPath(d)
         w.directoryChanged.connect(self._on_fs)
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)

@@ -69,7 +69,12 @@ class Organizer(object):
 
     # -- 扫描 ---------------------------------------------------------------
     def scan_pending(self, min_age=None):
-        """桌面上（顶层、非隐藏、非启动器）还没归档的文件。"""
+        """桌面上（顶层、非隐藏、非启动器）还没归档的文件。
+
+        Windows 上「用户桌面」和「公共桌面」合并显示成一个桌面，
+        所以两个目录都要扫（见 sysenv.desktop_dirs），否则公共桌面上
+        软件装的快捷方式会漏掉。归档目标始终是用户桌面下的同一个抽屉。
+        """
         if min_age is None:
             try:
                 min_age = int(self.cfg["general"].get("min_age", "3"))
@@ -77,22 +82,30 @@ class Organizer(object):
                 min_age = 3
         now = time.time()
         out = []
-        try:
-            names = sorted(os.listdir(self.desktop))
-        except OSError:
-            return out
-        for name in names:
-            path = os.path.join(self.desktop, name)
-            skip, _ = rules.should_skip(path)
-            if skip:
-                continue
+        roots = sysenv.desktop_dirs()
+        self.root = rules.shelf_root(self.desktop)   # 归档根固定在用户桌面
+        seen = set()
+        for root in roots:
             try:
-                if now - os.path.getmtime(path) < min_age:
-                    continue          # 刚写过的先不动，下一轮再说
+                names = sorted(os.listdir(root))
             except OSError:
                 continue
-            cat, sub = rules.classify(path)
-            out.append((path, cat, sub))
+            for name in names:
+                path = os.path.join(root, name)
+                key = os.path.normcase(os.path.abspath(path))
+                if key in seen:
+                    continue          # 两个桌面目录若有同名，只处理一次
+                seen.add(key)
+                skip, _ = rules.should_skip(path)
+                if skip:
+                    continue
+                try:
+                    if now - os.path.getmtime(path) < min_age:
+                        continue      # 刚写过的先不动，下一轮再说
+                except OSError:
+                    continue
+                cat, sub = rules.classify(path)
+                out.append((path, cat, sub))
         return out
 
     def pending_count(self):

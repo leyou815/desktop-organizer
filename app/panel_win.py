@@ -217,17 +217,19 @@ class PanelWin(object):
             # 关掉玻璃质感：只留模糊（仍半透明，但没有亚克力颗粒感）
             state = ACCENT_ENABLE_BLURBEHIND
 
-        # 色调：跟随系统亮/暗主题。
-        # Win11 (10.0.26200) 实测：亚克力模式下 GradientColor 直接当任务栏底色，
-        # 写死深色 0x1A1A1A 会把亮色主题的任务栏压成近黑；改成浅色才透亮。
-        # GradientColor 是 AABBGGRR，最高字节是色调不透明度。
-        # 浅色主题用白色系，深色主题用深灰系，alpha 越低越接近系统原生磨砂。
-        a = int(round(max(0.02, min(1.0, alpha)) * 255))
+        # 色调：透明度滑块映射到 RGB 明度。
+        # Win11 (10.0.26200) 实测：ACRYLICBLURBEHIND 的 GradientColor 里
+        #   - 最高字节 alpha 完全无效（00→FF 颜色纹丝不动）
+        #   - 低 24 位 RGB 才是任务栏底色（00=纯黑, 80=中灰, FF=近白）
+        # 所以必须把 alpha（0~1）映射成 RGB 明度，滑块才真正可控：
+        #   透明 0%  → 亮色主题偏白（透亮）/ 暗色主题偏黑（融进深色壁纸）
+        #   透明 92% → 亮色主题偏深（实心）/ 暗色主题偏亮（实心）
+        level = max(0.0, min(1.0, alpha))
         if _system_light():
-            rgb = 0x00FFFFFF           # 白（AABBGGRR 低位 RRGGBB=FFFFFF）
+            v = int(round(255 * (1.0 - level)))
         else:
-            rgb = 0x001A1A1A           # 深灰（暗色主题下才用深色）
-        tint = (a << 24) | rgb
+            v = int(round(255 * level))
+        tint = (0x80 << 24) | (v << 16) | (v << 8) | v   # AABBGGRR: 0xAARRGGBB -> 灰阶
         ok_any = False
         err = ""
         for h in hwnds:
