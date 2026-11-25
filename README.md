@@ -108,7 +108,15 @@
 
 ## 快速开始
 
-### Windows
+从 GitHub 下载后，先按你的情况选一条路：
+
+| 你的情况 | 走哪条 |
+|---|---|
+| 不想装 Python / 只想双击就用 | **下载 Release 里的 `DesktopOrganizer.exe`**，跳过下面所有步骤 |
+| 有 Python，想改代码或跑最新版 | 源码运行 / 装到系统（下方） |
+| 麒麟 V10 / Linux | 看下方「麒麟」一节 |
+
+### Windows（源码运行）
 
 需要 Python 3.8+ 和 PyQt5：
 
@@ -130,6 +138,19 @@ build_windows.bat
 ```
 
 卸载：`python uninstall_windows.py`（只删程序，已归档的文件不动）
+
+> **PyQt5 下载慢 / 装不上怎么办**：PyQt5 的 Qt 运行库有 48MB，某些网络下 pip 会
+> `IncompleteRead` 或超时。可以换国内源重试，例如华为源：
+> `pip install -r requirements.txt -i https://repo.huaweicloud.com/repository/pypi/simple/`
+> 或在浏览器里手动下载三个 wheel（`PyQt5`、`PyQt5-Qt5`、`pyqt5_sip`）后本地安装。
+
+### exe（免 Python）
+
+`dist/DesktopOrganizer.exe` 是约 39MB 的单文件，已经把 Python 和 PyQt 一起打进去了：
+下载后**双击即用**，不需要装 Python、不需要 `pip install`。首次运行会在
+`%APPDATA%\DesktopOrganizer` 生成配置文件。
+
+> 注：`dist/` 在 `.gitignore` 里，不随源码仓库分发；exe 请从 Releases 页面下载。
 
 ### 麒麟 V10 / Linux
 
@@ -463,6 +484,10 @@ Plus a slide-out drawer on the right screen edge with fuzzy search (supports Chi
 initials) and clickable app icons. Search results are selectable: move several files into any
 drawer folder (or a new one), batch-rename by find/replace with live preview, or send them to
 the system trash — all reversible with one Undo.
+
+**Install**: grab the standalone `DesktopOrganizer.exe` (~39 MB, Python included —
+no setup needed) from Releases, or run from source with Python 3.8+ and PyQt5
+(`pip install -r requirements.txt`). On Kylin: `bash install.sh`.
 
 Windows support was **verified on Windows 11 (build 26200)**: the self-test
 (`python tools/selftest_win.py`) passed 12/12 checks, including acrylic taskbar,
