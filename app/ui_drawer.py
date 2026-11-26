@@ -103,13 +103,14 @@ class Trigger(QWidget):
 class FileRow(QWidget):
     """一个文件（或子文件夹）条目，点击打开。"""
 
-    def __init__(self, pal, name, path, is_dir=False, count=0):
+    def __init__(self, pal, name, path, is_dir=False, count=0, tag=""):
         super(FileRow, self).__init__()
         self.pal = pal
         self.name = name
         self.path = path
         self.is_dir = is_dir
         self.count = count
+        self.tag = tag          # 右侧灰字：子分类名（Word / Excel …）或文件数
         self.setFixedHeight(26)
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip(path)
@@ -147,7 +148,7 @@ class FileRow(QWidget):
         if self.is_dir:
             tail = "  %d" % self.count if self.count else "  空"
         else:
-            tail = ""
+            tail = ("  " + self.tag) if self.tag else ""
         text = fm.elidedText(self.name, Qt.ElideMiddle, avail - fm.width(tail))
         p.setPen(QPen(self.pal.text))
         p.drawText(QRectF(22, 0, avail, self.height()), Qt.AlignVCenter | Qt.AlignLeft, text)
@@ -625,24 +626,67 @@ class CatRow(QWidget):
         self.body.setVisible(self.expanded)
 
     def _fill(self):
-        if self.cat in (rules.APP, rules.LINK):
+        if self.cat == rules.APP:
             self._fill_grid()
-            return
+        elif self.cat == rules.FOLDER:
+            self._fill_folders()
+        else:
+            self._fill_files()
+
+    def _fill_folders(self):
+        """文件夹分类：每一项本来就是文件夹，点开等于进目录，不用钻。"""
         shown = 0
         for name, path, is_dir, count in self.items:
             if shown >= 40:
-                more = QLabel("…… 还有 %d 个" % (len(self.items) - shown))
-                more.setStyleSheet("color:%s;font-size:11px;padding-left:22px;"
-                                   % self.pal.muted.name())
-                self.bl.addWidget(more)
+                self._more(len(self.items) - shown)
                 break
             self.bl.addWidget(FileRow(self.pal, name, path, is_dir, count))
             shown += 1
         if not self.items:
-            empty = QLabel("暂无文件")
-            empty.setStyleSheet("color:%s;font-size:11px;padding-left:22px;"
-                                % self.pal.muted.name())
-            self.bl.addWidget(empty)
+            self._empty()
+
+    def _fill_files(self):
+        """其他分类：钻到子分类目录底下，直接平铺文件名。
+
+        以前展开「文档」只看到 Word/ Excel/ PDF/ 几个子文件夹，还得再点
+        一层才见到文件。现在一次列全，点名字就用默认程序打开；子分类名
+        缩成右侧灰字，信息不丢但不占地方。
+        """
+        rows = []
+        for name, path, is_dir, count in self.items:
+            if not is_dir:
+                rows.append((name, path, ""))
+                continue
+            tag = name.rstrip("/")
+            for dirpath, dirnames, filenames in os.walk(path):
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                for f in filenames:
+                    if f.startswith(".") or f.startswith("~$"):
+                        continue
+                    rows.append((f, os.path.join(dirpath, f), tag))
+        rows.sort(key=lambda r: (r[0].lower(), r[2]))
+
+        shown = 0
+        for name, path, tag in rows:
+            if shown >= 80:
+                self._more(len(rows) - shown)
+                break
+            self.bl.addWidget(FileRow(self.pal, name, path, False, 0, tag=tag))
+            shown += 1
+        if not rows:
+            self._empty()
+
+    def _more(self, n):
+        more = QLabel("…… 还有 %d 个" % n)
+        more.setStyleSheet("color:%s;font-size:11px;padding-left:22px;"
+                           % self.pal.muted.name())
+        self.bl.addWidget(more)
+
+    def _empty(self):
+        empty = QLabel("暂无文件")
+        empty.setStyleSheet("color:%s;font-size:11px;padding-left:22px;"
+                            % self.pal.muted.name())
+        self.bl.addWidget(empty)
 
 
 # --------------------------------------------------------------------------- #
