@@ -1,2 +1,4 @@
 # 只有一个第三方依赖，Windows / 麒麟通用
-PyQt5>=5.12
+# 上限锁到 5.x：PyQt6 里 QDesktopWidget / QApplication.desktop() 等接口被删，
+# 装成最新版会直接 ImportError / AttributeError。
+PyQt5>=5.12,<6

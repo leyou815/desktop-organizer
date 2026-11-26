@@ -12,6 +12,7 @@
 只写当前用户目录和 HKCU 注册表，不需要管理员权限。
 """
 
+import base64
 import os
 import shutil
 import subprocess
@@ -54,15 +55,52 @@ def check_env():
 
 
 def copy_files(src, dst):
+    """先整份拷到临时目录，成功后再替换旧安装。
+
+    老版本是 rmtree(dst) 之后才 copytree：一旦拷贝中途失败（杀软占用、磁盘满），
+    用户就会连旧的可用版本都没了。这里改成 staged copy + 目录替换，
+    任何一步失败都不动原安装。
+    """
     print("==> 安装到 %s" % dst)
-    if os.path.isdir(dst):
-        shutil.rmtree(dst)
-    os.makedirs(dst)
-    for name in ("app", "assets"):
-        s = os.path.join(src, name)
-        if os.path.isdir(s):
-            shutil.copytree(s, os.path.join(dst, name))
+    names = [n for n in ("app", "assets") if os.path.isdir(os.path.join(src, n))]
+    if not names:
+        raise RuntimeError("源码目录里找不到 app/，可能是在错误的目录下运行")
+
+    tmp = dst + ".new"
+    old = dst + ".old"
+    for p in (tmp, old):
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+    os.makedirs(tmp)
+
+    try:
+        for name in names:
+            shutil.copytree(os.path.join(src, name), os.path.join(tmp, name))
+        # 关键文件校验：拷完发现还是空的就别替换（例如权限不足只建了空目录）
+        for must in ("app/cli.py", "app/app.py"):
+            if not os.path.isfile(os.path.join(tmp, *must.split("/"))):
+                raise RuntimeError("拷贝不完整，缺少 %s" % must)
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        print("    失败：已回滚，未改动现有安装")
+        raise
+
+    had_old = os.path.isdir(dst)
+    if had_old:
+        os.replace(dst, old)      # 同一分区上的目录改名是原子的
+    os.replace(tmp, dst)
+    if had_old:
+        shutil.rmtree(old, ignore_errors=True)
     print("    完成")
+
+
+def _ps_quote(s):
+    """PowerShell 单引号字面量转义：内部单引号写两遍。
+
+    用户名里带 ' 时（如 C:\\Users\\O'Brien），原实现直接把路径拼进 '...' 里，
+    PowerShell 会解析报错 → 快捷方式静默创建失败。
+    """
+    return "'" + str(s).replace("'", "''") + "'"
 
 
 def make_shortcut(dst):
@@ -71,21 +109,27 @@ def make_shortcut(dst):
     icon = os.path.join(dst, "assets", "icon.ico")
     ps = (
         "$ws = New-Object -ComObject WScript.Shell;"
-        "$s = $ws.CreateShortcut('%s');"
-        "$s.TargetPath = '%s';"
-        "$s.Arguments = '\"%s\" run';"
-        "$s.WorkingDirectory = '%s';"
+        "$s = $ws.CreateShortcut(%s);"
+        "$s.TargetPath = %s;"
+        "$s.Arguments = %s;"
+        "$s.WorkingDirectory = %s;"
         "%s"
         "$s.WindowStyle = 7;"
-        "$s.Description = '%s';"
+        "$s.Description = %s;"
         "$s.Save()"
-    ) % (lnk, pythonw(), entry, dst,
-         ("$s.IconLocation = '%s';" % icon) if os.path.isfile(icon) else "",
-         APP_NAME)
+    ) % (_ps_quote(lnk), _ps_quote(pythonw()),
+         _ps_quote('"%s" run' % entry), _ps_quote(dst),
+         ("$s.IconLocation = %s;" % _ps_quote(icon)) if os.path.isfile(icon) else "",
+         _ps_quote(APP_NAME))
     print("==> 创建开始菜单快捷方式")
     try:
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+        # 走 -EncodedCommand：脚本里再有特殊字符也不会被外层 shell 吃掉
+        enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                        "-EncodedCommand", enc],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if not os.path.isfile(lnk):
+            raise RuntimeError("快捷方式未生成")
         print("    %s" % lnk)
         return True
     except Exception as e:
@@ -120,7 +164,11 @@ def main():
         return 1
 
     dst = os.path.join(local_appdata(), FOLDER)
-    copy_files(src, dst)
+    try:
+        copy_files(src, dst)
+    except Exception as e:
+        print("        安装中止：%s" % e)
+        return 1
     make_shortcut(dst)
 
     print("==> 开机自启")

@@ -99,8 +99,30 @@ def schema_ok():
 # 面板后端
 # --------------------------------------------------------------------------- #
 class PanelCore(object):
+    BACKUP_KEY = "panel_kylin"      # 系统设置原值台账里的分类名
+
     def __init__(self, cfg):
         self.cfg = cfg          # 与主程序共用的 configparser
+        self._backed_up = False
+
+    # -- 原值备份 -----------------------------------------------------------
+    def _keys(self):
+        return ((SCHEMA_P, KEY_TRANS), (SCHEMA_P, KEY_BLURRY),
+                (SCHEMA_P, KEY_EFFECT), (SCHEMA_P, KEY_MENU),
+                (SCHEMA_S, KEY_GBLUR), (SCHEMA_S, KEY_SIDEBAR))
+
+    def _backup_once(self):
+        """第一次动系统设置前把原值记下来，之后 restore 才有东西可还原。
+
+        只记一次：反复拖动滑块不会把"用户原来的值"覆盖成"我们上次改的值"。
+        """
+        if self._backed_up:
+            return
+        vals = {}
+        for s, k in self._keys():
+            vals["%s|%s" % (s, k)] = _gget(s, k)    # None = 当时读不到，还原时不动它
+        sysenv.remember_system(self.BACKUP_KEY, vals)
+        self._backed_up = True
 
     # -- 能力 ---------------------------------------------------------------
     def supports_blur_level(self):
@@ -159,8 +181,15 @@ class PanelCore(object):
         except (TypeError, ValueError):
             return 0.6
 
-    def set_alpha(self, value, smooth=False):
+    def set_alpha(self, value, smooth=False, sync_glass=False):
+        """写任务栏透明度。
+
+        注意：这里默认 **不再** 顺带重放 apply_glass()——玻璃那三项（特效/全局模糊/
+        磨砂档位）跟透明度是两件事，每拖一格都重写一遍等于把 gsettings 子进程
+        放大三倍。需要联动玻璃的场景（比如切档位、开玻璃）请显式传 sync_glass=True。
+        """
         value = max(0.0, min(self.max_alpha(), float(value)))
+        self._backup_once()
         if smooth:
             start = self.get_alpha()
             if abs(value - start) > 0.01:
@@ -175,7 +204,8 @@ class PanelCore(object):
             raise PanelError("设置未生效（期望 %.2f，实际 %.2f）" % (value, actual))
 
         self.cfg["general"]["alpha"] = "%.3f" % value
-        self.apply_glass()
+        if sync_glass:
+            self.apply_glass()
         return value
 
     # -- 玻璃质感 -----------------------------------------------------------
@@ -208,6 +238,7 @@ class PanelCore(object):
             return
         self.cfg["general"]["blur_level"] = str(level)
         if self.glass_on():
+            self._backup_once()
             _gset(SCHEMA_P, KEY_BLURRY, level)
             _gset(SCHEMA_S, KEY_GBLUR, "true")
             _gset(SCHEMA_P, KEY_EFFECT, "true")
@@ -223,6 +254,7 @@ class PanelCore(object):
         """任务栏变透时，把菜单/侧边栏钉在系统默认的 72，保持可读。"""
         if self.cfg["general"].get("protect_popup", "1") != "1":
             return
+        self._backup_once()
         _gset(SCHEMA_S, KEY_MENU, 72)
         try:
             keys = set(_run([GSETTINGS, "list-keys", SCHEMA_S]).split())
@@ -233,9 +265,31 @@ class PanelCore(object):
 
     # -- 备份还原 -----------------------------------------------------------
     def restore(self):
-        for s, k in ((SCHEMA_P, KEY_TRANS), (SCHEMA_P, KEY_BLURRY),
-                     (SCHEMA_S, KEY_MENU), (SCHEMA_S, KEY_GBLUR)):
-            _run([GSETTINGS, "reset", s, k], check=False)
+        """还原系统外观：优先写回用户原来的值，而不是一律 reset 成系统默认。"""
+        saved = sysenv.recall_system(self.BACKUP_KEY)
+        if not saved:
+            # 没留下原值记录（历史版本改过、或上次还原后记录已清），只能踩回系统默认
+            for s, k in ((SCHEMA_P, KEY_TRANS), (SCHEMA_P, KEY_BLURRY),
+                         (SCHEMA_P, KEY_EFFECT), (SCHEMA_S, KEY_MENU),
+                         (SCHEMA_S, KEY_GBLUR)):
+                _run([GSETTINGS, "reset", s, k], check=False)
+            return True
+        ok = True
+        for name, raw in saved.items():
+            s, _, k = name.partition("|")
+            if not s or not k:
+                continue
+            try:
+                if raw is None:
+                    _run([GSETTINGS, "reset", s, k], check=False)
+                else:
+                    _gset(s, k, raw)
+            except PanelError:
+                ok = False
+        if ok:
+            sysenv.forget_system(self.BACKUP_KEY)
+            self._backed_up = False
+        return ok
 
 
 def get_backend(cfg):

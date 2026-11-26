@@ -17,7 +17,11 @@ echo "==> 检查环境"
 PY=/usr/bin/python3
 [ -x "$PY" ] || PY=$(command -v python3 || true)
 [ -n "$PY" ] || die "缺少 python3"
+# 代码里用了 f-string / 海象等 3.6+ 语法，但 PyQt5>=5.12 的轮子要求 3.8+
+"$PY" -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" \
+    || die "Python 版本过低：$("$PY" -c 'import sys;print("%d.%d"%sys.version_info[:2])')（需要 3.8+）"
 "$PY" -c "import PyQt5.QtWidgets" 2>/dev/null || die "缺少 python3-pyqt5（sudo apt install python3-pyqt5）"
+[ -d "$SRC/app" ] || die "源码目录里找不到 app/，请在项目根目录下运行本脚本"
 green "    Python：$PY"
 green "    系统：$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo 未知)"
 
@@ -29,11 +33,24 @@ else
 fi
 
 echo "==> 安装到 $DEST"
-rm -rf "$DEST"
-mkdir -p "$DEST" "$BIN" "$APPS"
-cp -r "$SRC/app" "$SRC/bin" "$SRC/assets" "$DEST"/
-chmod +x "$DEST/bin/zhengli"
-find "$DEST/app" -name "*.py" -exec chmod 644 {} \;
+mkdir -p "$BIN" "$APPS"
+# 先拷到 .new 再整体替换：中途失败（磁盘满 / 权限）不会把旧的可运行版本删掉
+STAGE="$DEST.new"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+trap 'rm -rf "$STAGE"' EXIT
+for part in app bin assets; do
+    [ -e "$SRC/$part" ] || continue
+    cp -r "$SRC/$part" "$STAGE"/
+done
+[ -f "$STAGE/app/cli.py" ] || die "拷贝不完整：缺少 app/cli.py，已中止（原安装未改动）"
+chmod +x "$STAGE/bin/zhengli"
+find "$STAGE/app" -name "*.py" -exec chmod 644 {} \;
+rm -rf "$DEST.old"
+if [ -d "$DEST" ]; then mv "$DEST" "$DEST.old"; fi
+mv "$STAGE" "$DEST"
+rm -rf "$DEST.old"
+trap - EXIT
 ln -sf "$DEST/bin/zhengli" "$BIN/zhengli"
 
 cat > "$APPS/desktop-organizer.desktop" <<EOF

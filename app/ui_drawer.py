@@ -13,25 +13,22 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt5.QtCore import (Qt, QRectF, QTimer, QPropertyAnimation, QEasingCurve,
-                          pyqtSignal, QObject, QUrl, QPoint, QFileSystemWatcher,
-                          QEvent, QFileInfo)
+                          pyqtSignal, QUrl, QPoint, QEvent, QFileInfo)
 from PyQt5.QtGui import (QColor, QPainter, QPainterPath, QLinearGradient, QPen,
-                         QBrush, QFont, QFontMetrics, QIcon, QPixmap, QDesktopServices)
+                         QBrush, QFontMetrics, QIcon, QDesktopServices)
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QVBoxLayout,
-                             QHBoxLayout, QScrollArea, QFrame, QMessageBox,
-                             QSizePolicy, QGridLayout, QLineEdit,
+                             QHBoxLayout, QScrollArea, QFrame, QGridLayout, QLineEdit,
                              QFileIconProvider, QStyle, QDialog)
-from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 
+import atomicio
 import bulkops
 import config as appcfg
 import fuzzy
 import launchers
 import rules
 import sysenv
-from organizer import Organizer
-from theme import Palette, CAT_COLORS
-from ui_bulk import ConfirmDialog, MoveDialog, PromptDialog, RenameDialog
+from theme import CAT_COLORS
+from ui_bulk import ConfirmDialog, MoveDialog, RenameDialog
 
 
 # --------------------------------------------------------------------------- #
@@ -177,7 +174,7 @@ def load_icon(spec=None, path=None):
         except Exception:
             pass
     if spec:
-        if os.path.isabs(spec) and os.path.exists(spec):
+        if os.path.isabs(spec) and os.path.exists(atomicio.win_long(spec)):
             ic = QIcon(spec)
             if not ic.isNull():
                 return ic
@@ -715,15 +712,11 @@ class Panel(QWidget):
         self._anchor = None         # Shift 连选的起点
         self._pending = []          # 最近一次批量操作的结果，用于提示
 
-        scr = QApplication.primaryScreen().availableGeometry()
-        self._top = scr.top() + 46
-        h = scr.height() - 92
-        self.setFixedHeight(h)
-        self._x_shown = scr.right() - self.WIDTH + 1   # 贴死屏幕右边缘，不留缝
-        self._x_hidden = scr.right() + 8
-        self.move(self._x_hidden, self._top)
-
         self.is_open = False
+        self._sync_geometry()          # 尺寸与贴边位置按当前主屏算
+
+        # 多屏 / 改分辨率 / 任务栏换边后要重算，否则抽屉会飘到屏幕外或高度错位
+        self._watch_screens()
         self._anim = QPropertyAnimation(self, b"pos", self)
         self._anim.setDuration(230)
         self._anim.setEasingCurve(QEasingCurve.OutCubic)
@@ -733,6 +726,58 @@ class Panel(QWidget):
         self._build()
         self.search_box.setVisible(False)   # 默认应用页，搜索只在文件页
         self.refresh()
+
+    # -- 几何 ---------------------------------------------------------------
+    def _sync_geometry(self):
+        """按当前主屏重算高度与左右两个停靠位。
+
+        availableGeometry 已经把任务栏算掉了：任务栏换到左边/上边时
+        scr.right()/scr.height() 也跟着变，所以不能缓存成常量。
+        """
+        scr = QApplication.primaryScreen().availableGeometry()
+        self._top = scr.top() + 46
+        self.setFixedHeight(max(240, scr.height() - 92))
+        self._x_shown = scr.right() - self.WIDTH + 1   # 贴死屏幕右边缘，不留缝
+        self._x_hidden = scr.right() + 8
+        self.move(self._x_shown if self.is_open else self._x_hidden, self._top)
+
+    def _watch_screens(self):
+        """插拔显示器 / 改分辨率时重算几何，避免抽屉跑到已拔掉的屏幕上。"""
+        app = QApplication.instance()
+        if app is None:
+            return
+        for sig in ("screenAdded", "screenRemoved", "primaryScreenChanged"):
+            signal = getattr(app, sig, None)
+            if signal is None:
+                continue
+            try:
+                signal.connect(self._on_screens_changed)
+            except Exception:
+                pass
+        self._bind_screen(QApplication.primaryScreen())
+
+    def _bind_screen(self, scr):
+        if scr is None:
+            return
+        try:
+            scr.availableGeometryChanged.disconnect(self._on_screens_changed)
+        except Exception:
+            pass
+        try:
+            scr.availableGeometryChanged.connect(self._on_screens_changed)
+        except Exception:
+            pass
+
+    def _on_screens_changed(self, *_):
+        # 主屏可能已经换人，重新绑定后再算几何
+        try:
+            self._bind_screen(QApplication.primaryScreen())
+            self._sync_geometry()
+            if self.is_open:
+                self._x_shown = QApplication.primaryScreen().availableGeometry().right() \
+                    - self.WIDTH + 1
+        except Exception:
+            pass
 
     # -- 结构 ---------------------------------------------------------------
     def _build(self):
@@ -1217,7 +1262,7 @@ class Panel(QWidget):
         self.opsbar.setVisible(True)
         self.hint.setVisible(False)
 
-        people = [p for p in self._checked if os.path.exists(p)]
+        people = [p for p in self._checked if os.path.exists(atomicio.win_long(p))]
         n_dir = len([p for p in people if os.path.isdir(p)])
         tail = "（含 %d 个文件夹，会整包处理）" % n_dir if n_dir else ""
         self.btn_move.setToolTip("搬进抽屉里别的分类，或新建一个文件夹" + tail)
@@ -1226,7 +1271,7 @@ class Panel(QWidget):
 
     # -- 批量动作 -----------------------------------------------------------
     def _bulk_paths(self):
-        paths = [p for p in self._checked if os.path.exists(p)]
+        paths = [p for p in self._checked if os.path.exists(atomicio.win_long(p))]
         if not paths:
             self._flash("选中的项目已经不在了")
             self._clear_sel()
