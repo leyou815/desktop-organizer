@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (QApplication, QDialog, QSystemTrayIcon, QMenu, QAct
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 
 import config as appcfg
+import crashlog
 import rules
 import snip
 import sysenv
@@ -769,6 +770,8 @@ def running_instance(pid_probe=False):
 
 def run(argv=None):
     argv = argv or sys.argv[1:]
+    # 尽早装上：QApplication 构造阶段崩也要留痕
+    crashlog.install(os.path.join(appcfg.CONFIG_DIR, "crash.log"))
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)

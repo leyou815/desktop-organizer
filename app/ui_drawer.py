@@ -1084,7 +1084,10 @@ class Panel(QWidget):
 
         # 蓝图网格：壁纸同款细网格，仅在内容区（跳过左侧 52px tab 条）
         p.save()
-        p.clipPath(path)
+        # 用 setClipPath 而不是 clipPath：PyQt5 里 clipPath 同时是
+        # "读取当前裁剪路径" 的无参版本，传参会被判成 too many arguments，
+        # 在 paintEvent 里抛异常等于整进程 abort。
+        p.setClipPath(path)
         gp = self.pal.grid
         p.setPen(QPen(gp, 1))
         step = 28
