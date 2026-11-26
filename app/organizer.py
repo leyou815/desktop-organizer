@@ -130,6 +130,7 @@ class Organizer(object):
         self.cfg = cfg if cfg is not None else load_config()
         self._index_cache = None
         self.last_errors = []      # 上一轮 apply/undo 里失败的项：[(路径, 原因)]
+        self.last_notes = []       # 不是错误、但用户该知道的处理（如公共桌面退回用户桌面）
 
     # -- 目录 ---------------------------------------------------------------
     def ensure_dirs(self):
@@ -205,6 +206,7 @@ class Organizer(object):
         self.ensure_dirs()
         self._index_cache = None
         self.last_errors = []
+        self.last_notes = []
         moves = self.scan_pending()
         if limit:
             moves = moves[:limit]
@@ -212,18 +214,24 @@ class Organizer(object):
         batch = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
         # 搬出去只需要"能删掉源目录里的条目"，搬回来还需要"能写进源目录"。
-        # 公共桌面这类 ACL 特殊的目录正好卡在后半段：先写个临时文件探一次，
-        # 探不通的目录整批不搬，免得用户拿到"搬得进去、撤不回来"的结果。
-        unwritable = {}
+        # 公共桌面（C:\Users\Public\Desktop）的默认 ACL 正好只给了后者的一半：
+        # 普通用户有 DE/DC（删除、删子项），没有 WD/AD（写、建），所以文件搬得出来、
+        # 搬不回去。早先的做法是整批跳过，代价是 Office / 微信 / QQ 这些「所有用户」
+        # 安装的图标永远收不进抽屉；现在改成照搬，但把撤销目标记成用户自己的桌面——
+        # 撤的时候图标一样回到眼前，不用求管理员。
+        restore_dir = {}
         if not dry_run:
             primary = os.path.normcase(os.path.abspath(self.desktop))
             for src, _cat, _sub in moves:
                 d = os.path.dirname(src)
-                if d in unwritable:
+                if d in restore_dir:
                     continue
                 if os.path.normcase(os.path.abspath(d)) == primary:
-                    continue          # 自己的桌面不探，省得平白多写一个临时文件
-                unwritable[d] = not sysenv.dir_writable(d)
+                    restore_dir[d] = ""        # 自己的桌面：不必探，省得平白多写临时文件
+                elif sysenv.dir_writable(d):
+                    restore_dir[d] = ""        # 能写回去：原路退回
+                else:
+                    restore_dir[d] = self.desktop   # 写不回去：退回用户桌面
 
         for src, cat, sub in moves:
             target_dir = rules.category_dir(self.root, cat, sub)
@@ -231,17 +239,14 @@ class Organizer(object):
             if dry_run:
                 done.append((src, dst))
                 continue
-            if unwritable.get(os.path.dirname(src)):
-                self.last_errors.append(
-                    (src, "所在目录不允许写入，搬出去就撤不回来，已跳过"))
-                continue
             try:
                 os.makedirs(target_dir, exist_ok=True)
                 dst = move_into(src, dst)        # 原子占位 + 搬运，重名绝不覆盖
             except (OSError, shutil.Error) as e:
                 self.last_errors.append((src, "%s" % e))
                 continue
-            if not self._log(batch, src, dst):
+            back = restore_dir.get(os.path.dirname(src), "")
+            if not self._log(batch, src, dst, back):
                 self.last_errors.append((src, "已移动，但撤销日志写入失败"))
             done.append((src, dst))
 
@@ -282,10 +287,16 @@ class Organizer(object):
             appcfg.atomic_write_text(LOG_FILE, lines)
         return back, stuck
 
-    def _log(self, batch, src, dst):
-        """追加一条撤销记录，返回是否写成功（失败要让用户知道，否则撤销不了）。"""
+    def _log(self, batch, src, dst, restore_dir=""):
+        """追加一条撤销记录，返回是否写成功（失败要让用户知道，否则撤销不了）。
+
+        restore_dir 为空表示"原路退回"；非空表示源目录写不进去（公共桌面），
+        撤销时把文件放到那个目录下，名字冲突照旧自动改名。
+        """
         rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "ts_num": time.time(),
                "batch": batch, "src": src, "dst": dst}
+        if restore_dir:
+            rec["restore_dir"] = restore_dir
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
             with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -333,6 +344,7 @@ class Organizer(object):
         target = [r for r in recs if r.get("batch") == batch]
         moved = []
         errors = []
+        notes = []
         for r in reversed(target):
             dst, src = r.get("dst"), r.get("src")
             if not dst or not src:
@@ -340,6 +352,13 @@ class Organizer(object):
             if not os.path.exists(atomicio.win_long(dst)):
                 errors.append((dst, "归档位置已不存在，跳过"))
                 continue
+            home = r.get("restore_dir")
+            if home and os.path.isdir(home):
+                # 原来是公共桌面里的图标，系统不允许我们写回去 → 放到用户自己的桌面。
+                # 图标一样回到眼前，而且下次整理还能再收一次。
+                src = os.path.join(home, os.path.basename(src))
+                notes.append("公共桌面没有写入权限，%s 已放回你的桌面"
+                             % os.path.basename(src))
             try:
                 back = move_into(dst, src)     # 原子占位：桌面同名不会被覆盖
             except (OSError, shutil.Error) as e:
@@ -347,6 +366,7 @@ class Organizer(object):
                 continue
             moved.append((dst, back))
         self.last_errors = errors
+        self.last_notes = notes
         if moved:
             # 撤销过的记录不再参与下一轮撤销；原子重写，断电不会留下半截日志
             keep = [r for r in recs if r.get("batch") != batch]

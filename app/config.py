@@ -21,9 +21,11 @@ DEFAULTS = {
     # 文件
     "auto_tidy": "0",         # 默认不自动整理，靠"一键整理"
     "min_age": "3",           # 3 秒内刚写过的文件不动
-    # Windows 公共桌面（C:\Users\Public\Desktop）默认不整理：它是系统级目录，
-    # 搬走会影响本机其它账号，写回权限也不一定还在（详见 sysenv.desktop_dirs）
-    "public_desktop": "0",
+    # Windows 公共桌面（C:\Users\Public\Desktop）默认纳入整理：
+    # Office / 微信 / QQ 这些「所有用户」安装的软件把图标放在那里，不扫就永远收不干净。
+    # 那个目录只给了删除权限、没给写入权限，所以撤销时退回用户自己的桌面
+    # （见 organizer.apply 的 restore_dir），不必求管理员。
+    "public_desktop": "1" if sysenv.IS_WINDOWS else "0",
     # 界面
     "tray_start": "1",        # 启动直接进托盘
     "show_edge": "1",         # 屏幕右侧入口条
@@ -45,6 +47,10 @@ DEFAULTS = {
     "pin_top": "1",                      # 贴图置顶
 }
 
+# 配置版本号。故意不放进 DEFAULTS：load() 第一行就 `dict(DEFAULTS)`，
+# 放进去的话"老配置里有没有版本号"永远读成最新，"该迁移"就永远判不出来。
+CFG_VER = "2"
+
 
 def load():
     cfg = configparser.ConfigParser()
@@ -56,6 +62,9 @@ def load():
             pass
     if "general" not in cfg:
         cfg["general"] = dict(DEFAULTS)
+    # 版本号必须在"填默认值"之前读：版本号一旦进了 DEFAULTS，
+    # 这里读到的永远是当前版本，老配置会被当成已迁移（踩过一次）。
+    old_ver = cfg["general"].get("cfg_ver")
     for k, v in DEFAULTS.items():
         if k not in cfg["general"]:
             cfg["general"][k] = v
@@ -70,6 +79,15 @@ def load():
         cfg["general"]["pin_toggle_hotkey"] = "<Shift>F3"
         cfg["general"]["hotkey_scheme"] = "snipaste"
         save(cfg)       # 迁移结果立刻落盘，否则下次启动会反复迁移、覆盖用户改过的键位
+
+    # 公共桌面从"默认不扫"改成"默认扫"。老配置里那个 0 是当年的默认值、不是用户的选择，
+    # 不迁过来的话设置页开关显示为关，用户会以为"我的工具收不进这些图标"。
+    migrate = os.path.isfile(CONFIG_FILE) and old_ver != CFG_VER
+    if migrate:
+        cfg["general"]["public_desktop"] = DEFAULTS["public_desktop"]
+    cfg["general"]["cfg_ver"] = CFG_VER
+    if migrate:
+        save(cfg)       # 迁完立刻落盘，否则每次启动都会重判一遍
     return cfg
 
 

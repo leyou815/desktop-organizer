@@ -834,8 +834,8 @@ class MainWindow(QWidget):
         if sysenv.IS_WINDOWS:
             self.sw_public = self._setting_row(
                 lay, "整理公共桌面快捷方式",
-                "「所有用户」安装的软件把图标放在 C:\\Users\\Public\\Desktop。"
-                "默认不动：搬走会影响本机其它账号，写回权限也可能不在（会先探一次）")
+                "「所有用户」装的软件（Office / 微信 / QQ…）图标在 C:\\Users\\Public\\Desktop。"
+                "系统只给删除权限、不给写回权限，所以撤销时图标会放回你自己的桌面")
             self.sw_public.toggled.connect(self._on_public_desktop)
 
         lay.addSpacing(6)

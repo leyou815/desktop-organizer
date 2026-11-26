@@ -168,29 +168,52 @@ class MoveTest(Base):
 
 
 # --------------------------------------------------------------------------- #
-# 只读目录：宁可不搬，也不制造"搬得进去撤不回来"
+# 公共桌面：搬得出来、写不回去 → 撤销退回用户自己的桌面
 # --------------------------------------------------------------------------- #
 class UnwritableRootTest(Base):
-    def test_unwritable_root_is_skipped(self):
+    """C:\\Users\\Public\\Desktop 的默认 ACL 给了普通用户 DE/DC（删除、删子项），
+    没给 WD/AD（写入、建文件），所以「搬得出来、搬不回去」是权限模型的必然结果。
+    早先的做法是整批不搬（图标永远收不进抽屉），现在改成照搬 + 撤销改道。"""
+
+    def _public_lnk(self):
         pub = os.path.join(self.tmp, "pub")
-        os.makedirs(pub)
+        os.makedirs(pub, exist_ok=True)
         f = os.path.join(pub, "微信.lnk")
         with open(f, "w", encoding="utf-8") as fh:
             fh.write("x")
-
         self.cfg["general"]["public_desktop"] = "1"
+        return pub, f
+
+    def test_moved_out_and_undo_goes_to_own_desktop(self):
+        pub, f = self._public_lnk()
         saved_pub, saved_w = sysenv.public_desktop_dir, sysenv.dir_writable
         sysenv.public_desktop_dir = lambda: pub
         sysenv.dir_writable = lambda p: False
         try:
             moved = self.org.apply()
+            self.assertEqual(len(moved), 1, self.org.last_errors)
+            self.assertFalse(os.path.isfile(f), "公共桌面的图标应该被收进抽屉")
+            self.assertTrue(os.path.isfile(
+                os.path.join(self.org.root, rules.APP, "微信.lnk")))
+
+            back = self.org.undo()
+            self.assertEqual(len(back), 1, self.org.last_errors)
         finally:
             sysenv.public_desktop_dir, sysenv.dir_writable = saved_pub, saved_w
 
-        self.assertEqual(moved, [])
-        self.assertTrue(os.path.isfile(f), "写不回去的文件不该被搬走")
-        self.assertTrue(any("不允许写入" in why for _p, why in self.org.last_errors),
-                        self.org.last_errors)
+        # 撤到用户自己的桌面，而不是没有写权限的公共桌面
+        self.assertTrue(os.path.isfile(os.path.join(self.desk, "微信.lnk")))
+        self.assertFalse(os.path.isfile(f))
+        self.assertFalse(self.org.last_errors, self.org.last_errors)
+        self.assertTrue(self.org.last_notes, "退回用户桌面这件事必须告诉用户")
+
+    def test_writable_root_restores_in_place(self):
+        """目录可写时（普通桌面）撤销必须原路退回，不能顺手改道。"""
+        self.touch("报告.pdf")
+        self.org.apply()
+        self.org.undo()
+        self.assertTrue(os.path.isfile(os.path.join(self.desk, "报告.pdf")))
+        self.assertFalse(self.org.last_notes)
 
 
 # --------------------------------------------------------------------------- #

@@ -636,6 +636,7 @@ class App(QObject):
     def _undo_inner(self):
         n = len(self.org.undo())
         errs = list(getattr(self.org, "last_errors", []) or [])
+        notes = list(getattr(self.org, "last_notes", []) or [])
         self.win.refresh()
         self.drawer.refresh()
         self._rebuild_tray_state()
@@ -646,6 +647,9 @@ class App(QObject):
                                      % (n, len(errs), errs[0][1]), undoable=False)
             else:
                 self.win.show_result("撤销失败：%s" % errs[0][1], undoable=False)
+        elif notes and n:
+            # 公共桌面里的图标写不回去，改放用户自己的桌面——不是失败，但要说清
+            self.win.show_result("已放回 %d 项。%s" % (n, notes[0]), undoable=False)
         return n
 
     def open_root(self):
