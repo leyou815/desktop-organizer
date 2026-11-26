@@ -6,7 +6,8 @@
 设计原则：
   1. 宁可不归类，也不归错类。拿不准的一律进「其他」。
   2. 绝不碰两类东西：.desktop（桌面启动器，移走快捷方式就废了）、
-     以 . 开头的文件（Office/WPS 的 .~ 临时锁文件、隐藏文件）。
+     以及任何临时/锁文件——Office 的 `~$文档.docx`、WPS 的 `.~文档.docx`、
+     以 . 开头的隐藏文件。这些是"程序还开着"的标记，搬走会让 Office 报错。
   3. 图标有专属位置：svg/ico/icns 直接归图标；
      带透明通道、正方形、边长 ≤256 的 png 也算图标（读 IHDR 判断，不依赖 Pillow）。
 """
@@ -96,6 +97,10 @@ _reg(CODE, [".py", ".pyw", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".json", ".json
 SKIP_EXT = {".directory", ".trashinfo", ".part", ".crdownload", ".tmp"}
 # 按文件名跳过（.ini 本身要按扩展名归到代码里，只有 desktop.ini 这类是系统文件）
 SYS_PLACEHOLDERS = {"desktop.ini", "thumbs.db", ".ds_store"}
+# Office 系列的属主锁文件前缀：Word/Excel/PPT 打开文件时生成 `~$文件名.docx`，
+# 用不着点开头也藏不住，但它跟 `.~` 一样是"程序还开着"的标记。
+# 搬走轻则 Office 提示"文件已被他人占用"，重则写入失败丢内容。
+LOCK_PREFIXES = ("~$",)
 
 # 图标类 png 的判定阈值
 ICON_MAX_SIDE = 256
@@ -122,6 +127,9 @@ def should_skip(path):
     if name.startswith("."):
         # .~xxx.docx 是 Word/WPS 的锁文件，隐藏文件也不该被搬走
         return True, "隐藏/临时文件"
+    if name.startswith(LOCK_PREFIXES):
+        # ~$xxx.docx：Office 的属主锁文件，程序关掉才会消失
+        return True, "Office 临时锁文件（文件正在被打开）"
     if sysenv.is_hidden(path):
         # Windows 上隐藏/系统属性的文件（desktop.ini 等）同样不动
         return True, "隐藏或系统文件"
@@ -218,6 +226,8 @@ def explain(name, path=None):
         return "跳过（未完成下载）"
     if name.startswith("."):
         return "跳过（隐藏/临时文件）"
+    if name.startswith(LOCK_PREFIXES):
+        return "跳过（Office 锁文件）"
     if path and os.path.islink(path):
         return LINK
     if path and os.path.isdir(path):

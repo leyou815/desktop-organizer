@@ -13,7 +13,9 @@
 所有色值、字体、字号、间距都从这里取，UI 层不写死。
 """
 
-from PyQt5.QtGui import QColor, QPalette, QFont
+import sys
+
+from PyQt5.QtGui import QColor, QPalette, QFont, QFontDatabase
 from PyQt5.QtWidgets import QApplication
 
 # --------------------------------------------------------------------------- #
@@ -29,6 +31,45 @@ FONT_DISPLAY = "Bahnschrift"      # 大标题 / 编号 / 数字（DIN 气质）
 FONT_MONO = "Cascadia Mono"       # 等宽标签（对应 NODE / ORIGIN / FLOW）
 FONT_UI = "Microsoft YaHei"       # 中文正文（Qt 内可用 family 名）
 FONT_UI_FALLBACK = "SimHei"
+
+# 回退链：上面三个都是 Windows 自带字体，麒麟/其它发行版上不存在，
+# 不配回退就会静默落到 Qt 默认族（数字与编号的视觉节奏就散了）。
+FONT_DISPLAY_CHAIN = ("Bahnschrift", "DIN Alternate", "DejaVu Sans Condensed",
+                      "DejaVu Sans", "Noto Sans CJK SC", "Sans Serif")
+FONT_MONO_CHAIN = ("Cascadia Mono", "Consolas", "DejaVu Sans Mono",
+                   "Noto Sans Mono", "Monospace")
+FONT_UI_CHAIN = ("Microsoft YaHei", "Noto Sans CJK SC", "WenQuanYi Micro Hei",
+                 "SimHei", "Sans Serif")
+
+_FAMILY_CACHE = {}
+
+
+def pick_family(chain):
+    """按候选顺序挑一个系统里真的装了的字体族。
+
+    Qt 的 QFont.setFamily() 不支持逗号分隔的回退链（那是 QSS 的语法），
+    所以这里查一次 QFontDatabase 自己挑；查不到就交回第一个候选让 Qt 回落。
+    """
+    key = tuple(chain)
+    hit = _FAMILY_CACHE.get(key)
+    if hit:
+        return hit
+    pick = chain[0]
+    try:
+        # QFontDatabase 必须有 QGuiApplication 才能用：没有时构造它会直接
+        # 触发 Qt 的 qFatal（进程静默退出，连 traceback 都没有）。
+        # 这种情况退回第一个候选，让 Qt 自己去回落，不要在这里把进程打死。
+        if QApplication.instance() is None:
+            return pick
+        have = set(QFontDatabase().families())
+        for name in chain:
+            if name in have:
+                pick = name
+                break
+    except Exception:
+        pass
+    _FAMILY_CACHE[key] = pick
+    return pick
 
 # 字号标度（px）
 SZ_MICRO = 10         # 标签 / 角标
@@ -101,14 +142,14 @@ class Palette(object):
     # -- 字体 ----------------------------------------------------------------
     def font_ui(self, size=SZ_BODY, bold=False):
         f = QFont()
-        f.setFamily(FONT_UI)
+        f.setFamily(pick_family(FONT_UI_CHAIN))
         f.setPointSizeF(size * 0.75)     # px -> pt 近似，Qt 用 pt
         f.setBold(bold)
         return f
 
     def font_display(self, size=SZ_DISPLAY, bold=True):
         f = QFont()
-        f.setFamily(FONT_DISPLAY)
+        f.setFamily(pick_family(FONT_DISPLAY_CHAIN))
         f.setPointSizeF(size * 0.75)
         f.setBold(bold)
         f.setLetterSpacing(QFont.AbsoluteSpacing, 0.5)
@@ -116,7 +157,7 @@ class Palette(object):
 
     def font_mono(self, size=SZ_MICRO):
         f = QFont()
-        f.setFamily(FONT_MONO)
+        f.setFamily(pick_family(FONT_MONO_CHAIN))
         f.setPointSizeF(size * 0.75)
         return f
 
@@ -134,10 +175,33 @@ class Palette(object):
     def ss_mono_tag(self):
         """等宽小标签：对应壁纸角落的 NODE / ORIGIN / FLOW。"""
         return ("font-family:'%s';font-size:%dpx;letter-spacing:1px;color:%s;"
-                % (FONT_MONO, SZ_MICRO, self.muted.name()))
+                % (pick_family(FONT_MONO_CHAIN), SZ_MICRO, self.muted.name()))
+
+
+def _win_system_light():
+    """Windows：系统主题是不是亮色（SystemUsesLightTheme=1）。读不到返回 None。"""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes"
+                            r"\Personalize") as k:
+            v, _ = winreg.QueryValueEx(k, "SystemUsesLightTheme")
+        return int(v) == 1
+    except Exception:
+        return None
 
 
 def system_is_dark():
+    """系统当前是不是深色主题。
+
+    Windows 必须读注册表：Qt5 不会自动跟随系统深色模式，QPalette 在 Win11 上
+    几乎恒为浅色——靠它判断的话，深色那套配色永远不会出现。
+    读不到（老系统/权限问题）才退回 Qt 调色板，Linux 也走这条。
+    """
+    if sys.platform.startswith("win"):
+        light = _win_system_light()
+        if light is not None:
+            return not light
     app = QApplication.instance()
     pal = app.palette() if app else QPalette()
     return pal.color(QPalette.Window).lightness() < 128

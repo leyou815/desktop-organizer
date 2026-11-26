@@ -11,7 +11,7 @@ libshortcut.so 自己分配，没有稳定约定，硬写 dconf 很容易留垃�
 Qt 事件循环上（不占线程、不用轮询）。零第三方依赖，纯 ctypes。
 
 限制：只在 X11 会话下有效（麒麟 V10 默认就是 X11）。Wayland 下会返回失败，
-此时请在 控制中心 → 快捷键 → 自定义 里绑 `kpg cycle`。
+此时请在 控制中心 → 快捷键 → 自定义 里绑 `zhengli show`。
 """
 
 import ctypes
@@ -123,7 +123,7 @@ class _X11Hotkey(QObject):
     triggered = pyqtSignal()
 
     def __init__(self, combo, parent=None):
-        super(Hotkey, self).__init__(parent)
+        super(_X11Hotkey, self).__init__(parent)
         self.combo = combo
         self._dpy = None
         self._notifier = None
@@ -196,7 +196,8 @@ class _X11Hotkey(QObject):
         if state["conflict"]:
             lib.XUngrabKey(dpy, keycode, mods, root)
             self._close()
-            self.error = ("快捷键 %s 已被其它程序占用，换一个：kpg hotkey \"<Ctrl><Alt>X\""
+            self.error = ("快捷键 %s 已被其它程序占用，换一个："
+                          "主窗口 → 设置 → 透明度快捷键（或改 config.ini 的 hotkey）"
                           % self.combo)
             return False
 
@@ -522,7 +523,8 @@ if sys.platform.startswith("win"):
             try:
                 user32 = ctypes.windll.user32
                 if not user32.RegisterHotKey(None, self._id, mods | MOD_NOREPEAT, vk):
-                    self.error = ("快捷键 %s 已被其它程序占用，换一个：khotkey \"<Ctrl><Alt>X\""
+                    self.error = ("快捷键 %s 已被其它程序占用，换一个："
+                                  "主窗口 → 设置 → 透明度快捷键（或改 config.ini 的 hotkey）"
                                   % self.combo)
                     return False
             except Exception as e:

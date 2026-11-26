@@ -37,6 +37,25 @@ FILE_ATTRIBUTE_SYSTEM = 0x4
 
 
 # --------------------------------------------------------------------------- #
+# 系统设置原值台账
+# --------------------------------------------------------------------------- #
+# 实现在 atomicio（它反过来要 import 本模块，所以这里只能在函数内延迟导入）
+def remember_system(kind, values):
+    import atomicio
+    return atomicio.remember_system(kind, values)
+
+
+def recall_system(kind):
+    import atomicio
+    return atomicio.recall_system(kind)
+
+
+def forget_system(kind):
+    import atomicio
+    return atomicio.forget_system(kind)
+
+
+# --------------------------------------------------------------------------- #
 # 目录
 # --------------------------------------------------------------------------- #
 def desktop_dir():
@@ -84,25 +103,66 @@ def _win_desktop_from_registry():
         return ""
 
 
-def desktop_dirs():
+def public_desktop_dir():
+    """Windows 公共桌面（C:\\Users\\Public\\Desktop）；其它平台返回空串。"""
+    if not IS_WINDOWS:
+        return ""
+    base = os.environ.get("PUBLIC")
+    if not base:
+        # 未设 PUBLIC 时按 <用户目录的父目录>\\Public 推：C:\\Users\\Admin → C:\\Users\\Public
+        base = os.path.join(os.path.dirname(os.path.expanduser("~")), "Public")
+    return os.path.join(base, "Desktop")
+
+
+def desktop_dirs(include_public=False, primary=None):
     """所有要在桌面上整理的位置。
+
+    primary 给了就用它当"用户桌面"（测试/自定义桌面走这条），
+    没给就交给 desktop_dir() 现算。
 
     Windows 把「当前用户桌面」和「公共桌面」合并显示成一个桌面：
     各软件装在公共桌面（C:\\Users\\Public\\Desktop）的快捷方式，用户看得见，
-    但只扫用户桌面就会漏掉。这里把两个都列出来，各自归档到同一个抽屉。
-    麒麟/Linux 只有一个桌面目录，返回单元素列表。
+    只扫用户桌面就会漏掉。但公共桌面是**系统级目录**：
+      * 搬走会影响本机其它账号（他们桌面上的图标一起消失）
+      * 写回权限不一定还在（ACL 允许"删自己可见的条目"未必允许"再写回去"）
+      * 软件升级/重装往往会把快捷方式重新生成
+    所以默认不纳入，只有用户在设置里显式打开 include_public 才扫。
+    麒麟/Linux 只有一个桌面目录，永远返回单元素列表。
     """
-    primary = desktop_dir()
-    out = [primary]
-    if IS_WINDOWS:
-        public = os.path.join(os.environ.get("PUBLIC") or
-                              os.path.join(os.path.expanduser("~").rsplit(os.sep, 1)[0],
-                                           "Public"), "Desktop")
-        if (os.path.isdir(public) and
-                os.path.normcase(os.path.abspath(public)) !=
-                os.path.normcase(os.path.abspath(primary))):
-            out.append(public)
+    base = primary or desktop_dir()
+    out = [base]
+    if include_public:
+        pub = public_desktop_dir()
+        if (pub and os.path.isdir(pub) and
+                os.path.normcase(os.path.abspath(pub)) !=
+                os.path.normcase(os.path.abspath(base))):
+            out.append(pub)
     return out
+
+
+def dir_writable(path):
+    """真的往目录里写一个临时文件试试（os.access 在 Windows 上不可靠）。
+
+    用来在搬文件**之前**确认撤得回来：搬出去只需要读 + 删源目录条目，
+    搬回来则需要写权限。公共桌面这类 ACL 特殊的目录正好会卡在后半段，
+    所以宁可先探一次，也不要让用户拿到一个"搬得进去、搬不回来"的整理结果。
+    """
+    if not os.path.isdir(path):
+        return False
+    probe = None
+    try:
+        import tempfile
+        fd, probe = tempfile.mkstemp(prefix=".do-probe-", dir=path)
+        os.close(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        if probe:
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
 
 
 def config_dir():
@@ -201,18 +261,21 @@ def set_autostart(on, exec_cmd):
     try:
         if on:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("[Desktop Entry]\n"
-                        "Type=Application\n"
-                        "Name=桌面整理\n"
-                        "Comment=启动后驻留托盘：任务栏透明度 + 桌面一键整理\n"
-                        "Exec=%s\n"
-                        "X-UKUI-Autostart-enabled=true\n"
-                        "X-GNOME-Autostart-enabled=true\n"
-                        "Hidden=false\n"
-                        "NoDisplay=true\n"
-                        "StartupNotify=false\n" % exec_cmd)
-        elif os.path.isfile(path):
+            text = ("[Desktop Entry]\n"
+                    "Type=Application\n"
+                    "Name=桌面整理\n"
+                    "Comment=启动后驻留托盘：任务栏透明度 + 桌面一键整理\n"
+                    "Exec=%s\n"
+                    "X-UKUI-Autostart-enabled=true\n"
+                    "X-GNOME-Autostart-enabled=true\n"
+                    "Hidden=false\n"
+                    "NoDisplay=true\n"
+                    "StartupNotify=false\n" % exec_cmd)
+            # 原子写：先写同目录 .tmp 再 os.replace。
+            # 直接 open(path, "w") 会先截断再写，若此时正好登录/崩溃，
+            # 桌面会话读到的是一个 0 字节或半截的 .desktop，自启就静默失效了。
+            return atomicio.atomic_write_text(path, text)
+        if os.path.isfile(path):
             os.remove(path)
         return True
     except OSError:
@@ -310,9 +373,39 @@ def set_virtual_hidden(hide):
         try:
             import winreg
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, HIDE_ICONS_KEY, 0,
-                                winreg.KEY_SET_VALUE) as k:
-                for clsid in _VIRTUAL_KEYS:
-                    winreg.SetValueEx(k, clsid, 0, winreg.REG_DWORD, 1 if hide else 0)
+                                winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as k:
+                if hide:
+                    # 藏之前先把每个图标的原值记下来：用户可能本来就只显示
+                    # 其中一两个（比如自己把"网络"关掉过），直接写 1 再写
+                    # 回 0 会把他的个人偏好一并抹掉。
+                    saved = {}
+                    for clsid in _VIRTUAL_KEYS:
+                        try:
+                            v, _ = winreg.QueryValueEx(k, clsid)
+                            saved[clsid] = int(v)
+                        except FileNotFoundError:
+                            saved[clsid] = None      # 原来没有这个值，还原时删掉
+                    remember_system("virtual_icons_win", saved)
+                    plan = dict((clsid, 1) for clsid in _VIRTUAL_KEYS)
+                else:
+                    saved = recall_system("virtual_icons_win")
+                    plan = {}
+                    for clsid in _VIRTUAL_KEYS:
+                        if clsid in saved:
+                            # None 表示原来就没这个值 → 还原成"没有"
+                            plan[clsid] = saved[clsid]
+                        else:
+                            plan[clsid] = 0        # 没有台账（旧版本改过）只能退回系统默认
+                for clsid, val in plan.items():
+                    if val is None:
+                        try:
+                            winreg.DeleteValue(k, clsid)
+                        except FileNotFoundError:
+                            pass
+                    else:
+                        winreg.SetValueEx(k, clsid, 0, winreg.REG_DWORD, int(val))
+            if not hide:
+                forget_system("virtual_icons_win")
             _refresh_desktop()
             return True
         except Exception:
@@ -348,17 +441,41 @@ def _kylin_virtual_hidden():
     return all(v is False for v in states)
 
 
+def _kylin_raw(key):
+    """原始 gsettings 值（'true' / 'false' / 自定义），读不到返回 None。"""
+    try:
+        out = subprocess.run(["/usr/bin/gsettings", "get", PEONY_SCHEMA, key],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, timeout=5).stdout.strip()
+        return out or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _kylin_set_virtual_hidden(hide):
+    if hide:
+        saved = {}
+        for k in _VIRTUAL_KEYS:
+            raw = _kylin_raw(k)
+            if raw is not None:
+                saved[k] = raw
+        remember_system("virtual_icons_kylin", saved)
+        plan = dict((k, "false") for k in _VIRTUAL_KEYS)
+    else:
+        saved = recall_system("virtual_icons_kylin")
+        plan = dict((k, saved.get(k) or "true") for k in _VIRTUAL_KEYS)
+
     ok = True
-    for k in _VIRTUAL_KEYS:
+    for k, val in plan.items():
         try:
-            p = subprocess.run(["/usr/bin/gsettings", "set", PEONY_SCHEMA, k,
-                                "true" if not hide else "false"],
+            p = subprocess.run(["/usr/bin/gsettings", "set", PEONY_SCHEMA, k, val],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                universal_newlines=True, timeout=5)
             ok = (p.returncode == 0 and "failed to commit" not in (p.stderr or "")) and ok
         except (OSError, subprocess.SubprocessError):
             ok = False
+    if ok and not hide:
+        forget_system("virtual_icons_kylin")
     return ok
 
 

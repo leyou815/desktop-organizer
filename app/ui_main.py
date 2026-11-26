@@ -14,18 +14,20 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PyQt5.QtCore import Qt, QRectF, QEasingCurve, QPropertyAnimation, QTimer, pyqtProperty
+from PyQt5.QtCore import (Qt, QRectF, QEasingCurve, QPropertyAnimation, QTimer,
+                          QThreadPool, QObject, QRunnable, pyqtSignal, pyqtProperty)
 from PyQt5.QtGui import (QColor, QPainter, QLinearGradient, QPainterPath, QPen,
-                         QBrush, QFont, QIcon, QPixmap)
+                         QBrush, QIcon, QPixmap)
 from PyQt5.QtWidgets import (QWidget, QLabel, QPushButton, QSlider, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QFrame, QStackedWidget,
-                             QAbstractButton, QSizePolicy, QScrollArea,
-                             QFileDialog)
+                             QAbstractButton, QSizePolicy, QFileDialog)
 
 import launchers
 import rules
-from panel_core import PRESETS, BLUR_NAMES, GLASS_MAX_ALPHA, preset_value
+import sysenv
+from panel_core import PRESETS, BLUR_NAMES, GLASS_MAX_ALPHA
 from theme import Palette, CAT_COLORS, system_is_dark
+from version import VERSION
 
 
 def app_icon(pal, size=64):
@@ -215,6 +217,33 @@ class StatCard(QFrame):
 # --------------------------------------------------------------------------- #
 # 主窗口
 # --------------------------------------------------------------------------- #
+class _AlphaSignals(QObject):
+    done = pyqtSignal(object, str)      # (实际生效值, 错误信息)
+
+
+class _AlphaJob(QRunnable):
+    """在线程池里跑一次 set_alpha。
+
+    Linux 上一次 set_alpha 要串行起 6 个 gsettings 子进程（合计 0.2–0.5 秒），
+    留在主线程就是一卡；挪进线程池后窗口还能继续响应拖动。
+    """
+
+    def __init__(self, panel, alpha):
+        super(_AlphaJob, self).__init__()
+        self.panel = panel
+        self.alpha = alpha
+        self.signals = _AlphaSignals()
+
+    def run(self):
+        try:
+            self.panel.set_alpha(self.alpha)
+            actual = self.panel.get_alpha()
+            err = ""
+        except Exception as e:      # 线程里抛异常没人接，必须自己兜住再回报
+            actual, err = None, "%s" % e
+        self.signals.done.emit(actual, err)
+
+
 class MainWindow(QWidget):
     WIDTH, HEIGHT = 764, 566
 
@@ -229,6 +258,12 @@ class MainWindow(QWidget):
         self.setWindowIcon(app_icon(self.pal))
         self._drag = None
         self._stats = {}
+        # 透明度落盘专用线程池：只许一条 gsettings 链在跑，避免并发写系统设置
+        self._alpha_pool = QThreadPool(self)
+        self._alpha_pool.setMaxThreadCount(1)
+        self._alpha_job = None
+        self._alpha_req = None
+        self._alpha_dirty = False
 
         self._build()
         self.refresh()
@@ -325,11 +360,20 @@ class MainWindow(QWidget):
         """ % (pal.text.name(), pal.accent.name())
 
     def status_hint(self, msg):
-        """左下角小字提示，几秒后自己消失。"""
+        """左下角小字提示，几秒后自己消失。
+
+        用同一个定时器反复 start()，不要每次 singleShot：连着触发两次时，
+        第一个定时器会在第 3.4 秒把第二次的提示提前清掉。
+        """
         if not hasattr(self, "rail_tip"):
             return
         self.rail_tip.setText(msg)
-        QTimer.singleShot(3400, lambda: self.rail_tip.setText(""))
+        if getattr(self, "_hint_timer", None) is None:
+            self._hint_timer = QTimer(self)
+            self._hint_timer.setSingleShot(True)
+            self._hint_timer.setInterval(3400)
+            self._hint_timer.timeout.connect(lambda: self.rail_tip.setText(""))
+        self._hint_timer.start()
 
     def goto(self, i):
         self.stack.setCurrentIndex(i)
@@ -351,7 +395,14 @@ class MainWindow(QWidget):
         t = QLabel("任务栏透明度")
         t.setFont(pal.font_ui(17, bold=True))
         t.setStyleSheet("color:%s;" % pal.text.name())
-        sub = QLabel("拉低就透出壁纸，磨砂质感始终保留")
+        # Windows 上这个滑块实际控制的是任务栏底色明度（Acrylic 的 alpha 无效），
+        # 方向是"数值越大越深越实"，和麒麟的 gsettings 透明度不完全一样，
+        # 所以提示文案按平台分开写，别让用户按错方向找半天。
+        if sysenv.IS_WINDOWS:
+            sub_text = "数值越小越贴近壁纸，越大越深越实；磨砂质感始终保留"
+        else:
+            sub_text = "拉低就透出壁纸，磨砂质感始终保留"
+        sub = QLabel(sub_text)
         sub.setFont(pal.font_mono(10))
         sub.setStyleSheet("color:%s;" % pal.muted.name())
         box.addWidget(t)
@@ -378,6 +429,7 @@ class MainWindow(QWidget):
             border-radius:10px;}
         """ % (pal.line.name(), pal.accent.name()))
         self.slider.valueChanged.connect(self._on_slider)
+        self.slider.sliderReleased.connect(self._commit_alpha)   # 松手立刻落盘，不等防抖
         lay.addWidget(self.slider)
 
         chips = QHBoxLayout()
@@ -437,9 +489,14 @@ class MainWindow(QWidget):
         self.blur_row.setVisible(self.app.panel.supports_blur_level())
         lay.addWidget(self.blur_row)
         lay.addSpacing(4)
-        lay.addWidget(self._hint_card(
-            "磨砂由系统合成器（ukui-kwin）渲染。任务栏没变化时先确认两件事："
-            "合成器在运行；控制中心 → 个性化 → 特效 处于开启状态。"))
+        if sysenv.IS_WINDOWS:
+            lay.addWidget(self._hint_card(
+                "任务栏由系统「亚克力」合成。没有变化时先确认：设置 → 个性化 → 颜色 → "
+                "透明效果 处于开启状态；资源管理器重启后程序会在几秒内自动重新贴一次。"))
+        else:
+            lay.addWidget(self._hint_card(
+                "磨砂由系统合成器（ukui-kwin）渲染。任务栏没变化时先确认两件事："
+                "合成器在运行；控制中心 → 个性化 → 特效 处于开启状态。"))
         lay.addStretch(1)
 
         self.panel_status = QLabel("")
@@ -724,6 +781,15 @@ class MainWindow(QWidget):
             "「计算机 / 回收站 / 主目录」不是文件，搬不走；开启后隐藏桌面图标，在抽屉「应用」里给同等入口")
         self.sw_virtual.toggled.connect(self._on_virtual)
 
+        # 说明写清楚代价：公共桌面是系统级目录，不是"多扫一个文件夹"这么简单
+        self.sw_public = None
+        if sysenv.IS_WINDOWS:
+            self.sw_public = self._setting_row(
+                lay, "整理公共桌面快捷方式",
+                "「所有用户」安装的软件把图标放在 C:\\Users\\Public\\Desktop。"
+                "默认不动：搬走会影响本机其它账号，写回权限也可能不在（会先探一次）")
+            self.sw_public.toggled.connect(self._on_public_desktop)
+
         lay.addSpacing(6)
         hint = QFrame()
         hint.setStyleSheet("QFrame{background:%s;border:1px solid %s;border-radius:9px;}"
@@ -835,7 +901,8 @@ class MainWindow(QWidget):
         cfg = self.cfg
         alpha = self.app.panel.get_alpha()
         self.slider.blockSignals(True)
-        self.slider.setValue(int(round(alpha * 100)))
+        self.slider.setRange(0, int(round(self.app.panel.max_alpha() * 100)))  # 玻璃开=92，关=100
+        self.slider.setValue(min(100, int(round(alpha * 100))))
         self.slider.blockSignals(False)
         self._sync_panel(alpha)
 
@@ -884,6 +951,8 @@ class MainWindow(QWidget):
         self.sw_tray.set_silent(self.app.flag("tray_start"))
         self.sw_edge.set_silent(self.app.flag("show_edge"))
         self.sw_autotidy.set_silent(self.app.flag("auto_tidy"))
+        if getattr(self, "sw_public", None) is not None:
+            self.sw_public.set_silent(self.app.flag("public_desktop"))
         try:
             self.sw_virtual.set_silent(bool(launchers.virtual_hidden()))
         except Exception:
@@ -894,7 +963,7 @@ class MainWindow(QWidget):
             self.blur_row.setVisible(self.app.panel.supports_blur_level())
         except Exception:
             pass
-        self.ver_lb.setText("v1.0 · %s" % os.path.basename(self.app.org.root))
+        self.ver_lb.setText("v%s · %s" % (VERSION, os.path.basename(self.app.org.root)))
         self.rail_tip.setText("归档位置\n%s" % self.app.org.root.replace(
             os.path.expanduser("~"), "~"))
 
@@ -908,25 +977,82 @@ class MainWindow(QWidget):
         self.result_lb.setText(text)
         self.btn_undo.setVisible(undoable)
         self.result.setVisible(True)
-        QTimer.singleShot(6000, lambda: self.result.setVisible(False))
+        # 同一个定时器重复 start()：连续整理两次时，不能被上一次的 6 秒定时器提前藏掉
+        if getattr(self, "_result_timer", None) is None:
+            self._result_timer = QTimer(self)
+            self._result_timer.setSingleShot(True)
+            self._result_timer.setInterval(6000)
+            self._result_timer.timeout.connect(lambda: self.result.setVisible(False))
+        self._result_timer.start()
 
     # -- 交互 ---------------------------------------------------------------
     def _on_slider(self, v):
+        """拖动过程中只更新预览，绝不碰系统设置。
+
+        Linux 上一次 set_alpha 要起好几个 gsettings 子进程（每个 30–80ms，还在主线程），
+        100 格全落盘就是几十秒卡顿；这里先用防抖计时器攒着，停手 180ms 后一次性提交。
+        """
         alpha = v / 100.0
         try:
-            self.app.panel.set_alpha(alpha)
-            self._sync_panel(self.app.panel.get_alpha())
-            self.app.save_cfg()
-        except Exception as e:
-            self.panel_status.setText("设置失败：%s" % e)
+            self._sync_panel(alpha)
+        except Exception:
+            pass
+        if getattr(self, "_alpha_timer", None) is None:
+            self._alpha_timer = QTimer(self)
+            self._alpha_timer.setSingleShot(True)
+            self._alpha_timer.setInterval(180)
+            self._alpha_timer.timeout.connect(self._commit_alpha)
+        self._alpha_timer.start()
+
+    def _commit_alpha(self):
+        """把滑块当前值真正写进系统，并把「实际生效值」回写到滑块。
+
+        真正写系统的那一步丢到线程池去做；上一次还没回来时只置 dirty 标记，
+        等回调里补跑一次最新值——既不会并发写系统设置，也不会丢掉最后一次调整。
+        """
+        if getattr(self, "_alpha_timer", None) is not None:
+            self._alpha_timer.stop()
+        if self._alpha_job is not None:
+            self._alpha_dirty = True
+            return
+        alpha = self.slider.value() / 100.0
+        self._alpha_req = alpha
+        job = _AlphaJob(self.app.panel, alpha)
+        # 连到成员方法（QObject 上的槽）才会走队列连接，回到主线程执行；
+        # 直接连 lambda 会在线程池线程里跑，改 UI 会崩。
+        job.signals.done.connect(self._on_alpha_done)
+        self._alpha_job = job
+        self._alpha_pool.start(job)
+
+    def _on_alpha_done(self, actual, err):
+        """线程池回调：写盘、回弹滑块、补跑脏值，全部留在主线程。"""
+        self._alpha_job = None
+        requested = self._alpha_req
+        if err:
+            self.panel_status.setText("设置失败：%s" % err)
+        else:
+            try:
+                self.app.save_cfg()      # 配置写盘留在主线程，别和界面抢同一份 ini
+                self._sync_panel(actual)
+                # 玻璃开启时系统会把透明度钳在 92%，滑块必须跟着回弹，
+                # 否则 UI 显示 100% 而真实值是 92%——用户以为设置生效了。
+                if requested is not None and abs(actual - requested) > 0.005:
+                    self.slider.blockSignals(True)
+                    self.slider.setValue(int(round(actual * 100)))
+                    self.slider.blockSignals(False)
+            except Exception as e:
+                self.panel_status.setText("设置失败：%s" % e)
+        if self._alpha_dirty:
+            self._alpha_dirty = False
+            self._commit_alpha()
 
     def _on_preset(self, val):
-        try:
-            self.app.panel.set_alpha(val)
-            self._sync_panel(self.app.panel.get_alpha())
-            self.app.save_cfg()
-        except Exception as e:
-            self.panel_status.setText("设置失败：%s" % e)
+        """预设档位：只改滑块，落盘统一走异步提交，避免点击瞬间卡一下。"""
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(round(val * 100)))
+        self.slider.blockSignals(False)
+        self._sync_panel(val)
+        self._commit_alpha()
 
     def _on_glass(self, on):
         self.app.panel.set_glass(on)
@@ -935,11 +1061,25 @@ class MainWindow(QWidget):
                 self.app.panel.apply_glass()
                 self._sync_panel(self.app.panel.get_alpha())
             self.app.save_cfg()
+            self._apply_slider_range()
             self.panel_status.setText(
                 "玻璃质感已开启：透明度上限 %d%%" % int(GLASS_MAX_ALPHA * 100) if on
                 else "玻璃质感已关闭：可拉到 100%（会变成实心色块）")
         except Exception as e:
             self.panel_status.setText("设置失败：%s" % e)
+
+    def _apply_slider_range(self):
+        """玻璃开启时把滑块上限钳到 92%，别让用户拉到系统根本达不到的档位。"""
+        try:
+            top = int(round(self.app.panel.max_alpha() * 100))
+        except Exception:
+            top = 100
+        cur = self.slider.value()
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, top)
+        self.slider.setValue(min(cur, top))
+        self.slider.blockSignals(False)
+        self._sync_panel(self.slider.value() / 100.0)
 
     def _on_blur(self, level):
         self.app.panel.set_blur_level(level)
@@ -964,6 +1104,20 @@ class MainWindow(QWidget):
     def _on_edge(self, on):
         self._set_flag("show_edge", on)
         self.app.apply_edge()
+
+    def _on_public_desktop(self, on):
+        """公共桌面纳入/移出整理：改配置 + 重建监听器 + 刷新所有视图。"""
+        self._set_flag("public_desktop", on)
+        try:
+            self.app.rebuild_watcher()
+        except Exception:
+            pass
+        self.refresh()
+        self.app.drawer.refresh()
+        if on:
+            self.app._toast("已纳入公共桌面，待整理 %d 项" % self.app.org.pending_count())
+        else:
+            self.app._toast("公共桌面已排除：本机其它账号的图标不再受影响")
 
     def _set_flag(self, key, on):
         self.app.cfg["general"][key] = "1" if on else "0"

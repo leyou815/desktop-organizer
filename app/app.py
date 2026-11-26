@@ -12,10 +12,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PyQt5.QtCore import QObject, QPoint, QTimer, Qt, QFileSystemWatcher
-from PyQt5.QtGui import QIcon
-from PyQt5.QtWidgets import (QApplication, QDialog, QSystemTrayIcon, QMenu, QAction,
-                             QMessageBox)
+from PyQt5.QtCore import QObject, QPoint, QTimer, QFileSystemWatcher
+from PyQt5.QtWidgets import (QApplication, QDialog, QSystemTrayIcon, QMenu, QAction)
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 
 import config as appcfg
@@ -32,7 +30,6 @@ from ui_snip import PinWindow, SnipOverlay
 
 APP_NAME = "桌面整理"
 SERVER_KEY = "desktop-organizer"
-VERSION = "1.0"
 
 # 自启位置由平台层决定：麒麟写 autostart/*.desktop，Windows 写注册表 Run 项
 AUTOSTART_FILE = sysenv.autostart_path()
@@ -76,6 +73,9 @@ class App(QObject):
         self.pins = []                  # 贴在屏幕上的图
         self._overlay = None            # 正在进行的截图
         self._snip_busy = False
+        self._busy = False          # 整理/撤销互斥闸，防止五入口重入
+        self._tray_timer = None
+        self._win_timer = None
 
         self.tray = self._build_tray()
         self.hotkeys = self._build_hotkeys()
@@ -223,11 +223,17 @@ class App(QObject):
         self.save_cfg()
         self.apply_edge()
 
-        # Windows 上 explorer 重启会让任务栏句柄失效，隔几秒复查一次
-        self._keep = QTimer(self)
-        self._keep.setInterval(4000)
-        self._keep.timeout.connect(self._keep_panel)
-        self._keep.start()
+        # Windows 上 explorer 重启会让任务栏句柄失效，隔几秒复查一次。
+        # 定时器只建一次、复用同一个：每次都 new 一个会让老定时器无人回收，
+        # 反复点菜单就会攒出一堆同时跑的回调。
+        if getattr(self, "_keep", None) is None:
+            self._keep = QTimer(self)
+            self._keep.setInterval(4000)
+            self._keep.timeout.connect(self._keep_panel)
+        if on:
+            self._keep.start()
+        else:
+            self._keep.stop()
         if hasattr(self.win, "refresh"):
             self.win.refresh()
 
@@ -497,27 +503,58 @@ class App(QObject):
             self.win.status_hint(msg)
 
     # ---------------------------------------------------------------- 监听
+    def _desktop_roots(self):
+        """要监听/整理的桌面目录。
+
+        Windows 的公共桌面按「设置 → 整理公共桌面快捷方式」决定，默认不含：
+        那是系统级目录，搬走会影响本机其它账号，写回权限也不一定还在。
+        """
+        return sysenv.desktop_dirs(include_public=self.flag("public_desktop"))
+
     def _build_watcher(self):
+        # 防抖定时器只建一次：重建监听器时不能顺手再挂一个 QTimer
+        if getattr(self, "_debounce", None) is None:
+            self._debounce = QTimer(self)
+            self._debounce.setSingleShot(True)
+            self._debounce.setInterval(1500)
+            self._debounce.timeout.connect(self._auto_tidy)
         w = QFileSystemWatcher(self)
-        # Windows 公共桌面和用户桌面合并显示，两个都要监听
-        for d in sysenv.desktop_dirs():
+        for d in self._desktop_roots():
             if os.path.isdir(d):
                 w.addPath(d)
         w.directoryChanged.connect(self._on_fs)
-        self._debounce = QTimer(self)
-        self._debounce.setSingleShot(True)
-        self._debounce.setInterval(1500)
-        self._debounce.timeout.connect(self._auto_tidy)
         return w
+
+    def rebuild_watcher(self):
+        """改了要监听的桌面目录之后重建一次监听器。"""
+        old = getattr(self, "watcher", None)
+        self.watcher = self._build_watcher()
+        if old is not None:
+            try:
+                old.deleteLater()
+            except Exception:
+                pass
+        self._rebuild_tray_state()
 
     def _on_fs(self, _path):
         if self.flag("auto_tidy"):
             self._debounce.start()
-        QTimer.singleShot(400, self._rebuild_tray_state)
+        # 固定两个定时器反复 start()：原来每次变动都排一个 singleShot，
+        # 浏览器/下载工具一次写几百个文件就会堆出几百个待执行回调。
+        if getattr(self, "_tray_timer", None) is None:
+            self._tray_timer = QTimer(self)
+            self._tray_timer.setSingleShot(True)
+            self._tray_timer.setInterval(400)
+            self._tray_timer.timeout.connect(self._rebuild_tray_state)
+            self._win_timer = QTimer(self)
+            self._win_timer.setSingleShot(True)
+            self._win_timer.setInterval(700)
+            self._win_timer.timeout.connect(self._refresh_window_safe)
+        self._tray_timer.start()
         # 窗口开着的时候，桌面来了新文件要立刻反映出来，
         # 否则「一键整理」按钮一直是灰的，点了像没反应
         if self.win.isVisible():
-            QTimer.singleShot(700, self._refresh_window_safe)
+            self._win_timer.start()
 
     def _refresh_window_safe(self):
         if self.win.isVisible() and not self.win.slider.isSliderDown():
@@ -532,7 +569,20 @@ class App(QObject):
 
     # ---------------------------------------------------------------- 整理
     def tidy(self, notify=False, open_drawer=False):
-        """一键整理：扫描桌面 → 归类 → 刷新界面 / 托盘 / 抽屉。"""
+        """一键整理：扫描桌面 → 归类 → 刷新界面 / 托盘 / 抽屉。
+
+        _busy 是五入口（按钮 / 托盘 / 自动整理 / IPC / CLI）的互斥闸：
+        重入时两路会同时扫到同一批文件，正好撞上搬运占位冲突。
+        """
+        if getattr(self, "_busy", False):
+            return []
+        self._busy = True
+        try:
+            return self._tidy_inner(notify, open_drawer)
+        finally:
+            self._busy = False
+
+    def _tidy_inner(self, notify=False, open_drawer=False):
         try:
             moved = self.org.apply()
         except Exception as e:
@@ -543,26 +593,58 @@ class App(QObject):
         self.win.refresh()
         self.drawer.refresh()
         self._rebuild_tray_state()
+
+        # 搬失败/记账失败的项必须让用户看到，否则"整理完了"是假象
+        errs = list(getattr(self.org, "last_errors", []) or [])
+        tail = ""
+        if errs:
+            first = errs[0]
+            # first[0] 为空是"整批回滚"这类整体结论，没有具体文件可点名
+            who = (os.path.basename(first[0]) or first[0]) if first[0] else ""
+            tail = "；%d 项没搬成（%s%s）" % (
+                len(errs), (who + "：") if who else "", first[1])
         if moved:
-            self.win.show_result("已整理 %d 项，归档到「%s」" % (len(moved), rules.SHELF_DIRNAME))
+            self.win.show_result("已整理 %d 项，归档到「%s」%s"
+                                 % (len(moved), rules.SHELF_DIRNAME, tail))
             if open_drawer:
                 self.open_drawer()
+        elif errs:
+            self.win.show_result("有 %d 项没能归档%s" % (len(errs), tail), undoable=False)
         else:
             self.win.show_result("桌面上没有需要归类的文件", undoable=False)
         if notify and self.tray:
-            self.tray.showMessage(APP_NAME,
-                                  "已整理 %d 项" % len(moved) if moved else "桌面已经很干净",
-                                  QSystemTrayIcon.Information, 2600)
+            msg = "已整理 %d 项" % len(moved) if moved else "桌面已经很干净"
+            if errs:
+                msg += "，%d 项失败" % len(errs)
+            self.tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Information, 3000)
         return moved
 
     def tidy_from_ui(self):
         return self.tidy(notify=False)
 
     def undo(self):
+        if getattr(self, "_busy", False):
+            # 正在整理时撤销会把两边状态搅乱，直接忽略（按钮此时也该是灰的）
+            return 0
+        self._busy = True
+        try:
+            return self._undo_inner()
+        finally:
+            self._busy = False
+
+    def _undo_inner(self):
         n = len(self.org.undo())
+        errs = list(getattr(self.org, "last_errors", []) or [])
         self.win.refresh()
         self.drawer.refresh()
         self._rebuild_tray_state()
+        if errs:
+            # 撤不回来的项也要说清楚，不能让用户以为已经放回去了
+            if n:
+                self.win.show_result("已放回 %d 项，%d 项没撤成（%s）"
+                                     % (n, len(errs), errs[0][1]), undoable=False)
+            else:
+                self.win.show_result("撤销失败：%s" % errs[0][1], undoable=False)
         return n
 
     def open_root(self):
@@ -633,8 +715,19 @@ class App(QObject):
         self._rebuild_tray_state()
 
     def quit(self):
+        if getattr(self, "_quiting", False):     # aboutToQuit 也会进来，别跑两遍
+            return
+        self._quiting = True
         if getattr(self, "hotkeys", None):
             self.hotkeys.stop()
+        # 退出前把自己动过的系统设置写回原值。任务栏透明度、隐藏的系统图标
+        # 都是"程序活着才有意义"的状态：不还原等于把用户系统留在半改状态。
+        panel = getattr(self, "panel", None)
+        if panel is not None:
+            try:
+                panel.restore()
+            except Exception:
+                pass
         for pin in list(getattr(self, "pins", [])):
             try:
                 pin.close()
@@ -646,16 +739,32 @@ class App(QObject):
 # --------------------------------------------------------------------------- #
 # 单实例 IPC
 # --------------------------------------------------------------------------- #
-def send_to_existing(cmd):
+def send_to_existing(cmd, timeout=250):
     s = QLocalSocket()
     s.connectToServer(SERVER_KEY)
-    if not s.waitForConnected(250):
+    if not s.waitForConnected(timeout):
+        s.abort()
+        s.deleteLater()
         return False
     s.write(cmd.encode())
     s.flush()
-    s.waitForBytesWritten(250)
+    s.waitForBytesWritten(timeout)
     s.disconnectFromServer()
+    s.deleteLater()
     return True
+
+
+def running_instance(pid_probe=False):
+    """探一下有没有实例在监听（只连一下、不发命令、不清理 socket）。
+
+    只在连上的瞬间返回 True，调用方据此决定"转发命令"还是"自己接管"。
+    """
+    s = QLocalSocket()
+    s.connectToServer(SERVER_KEY)
+    ok = bool(s.waitForConnected(250))
+    s.abort()              # 不 disconnectFromServer，避免服务端收到空行
+    s.deleteLater()
+    return ok
 
 
 def run(argv=None):
@@ -664,12 +773,22 @@ def run(argv=None):
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
 
-    QLocalServer.removeServer(SERVER_KEY)
-    server = QLocalServer()
-    if not server.listen(SERVER_KEY):
-        # 已经有实例：把命令转过去
+    # 关键顺序：先探测、再接管。
+    # 以前是"先 removeServer 再 listen"，等于把正在服役的实例的 socket 抢走：
+    # 老实例还在跑、还在处理文件，新实例又起来了，两边抢同一批桌面文件。
+    if running_instance():
         send_to_existing("show")
         return 0
+
+    server = QLocalServer()
+    if not server.listen(SERVER_KEY):
+        # 探测说没人监听，listen 却失败：多半是上次崩溃留下的僵尸 socket。
+        # 这种才清掉重试一次；重试还不行说明真有人占着，转过去就好。
+        QLocalServer.removeServer(SERVER_KEY)
+        server = QLocalServer()
+        if not server.listen(SERVER_KEY):
+            send_to_existing("show")
+            return 0
 
     ctl = App(argv)
     app._app = ctl
@@ -678,11 +797,26 @@ def run(argv=None):
         c = server.nextPendingConnection()
         if c is None:
             return
-        c.waitForReadyRead(150)
+        # 一次 readAll 不保证拿到完整命令（write 可能被拆包），
+        # 读到没有新数据为止，再按行/大小上限兜底。
+        data = bytearray()
+        c.waitForReadyRead(300)
+        while len(data) < 4096:
+            chunk = bytes(c.readAll())
+            if not chunk:
+                if not c.waitForReadyRead(150):     # 已经没有后续数据了
+                    break
+                continue
+            data += chunk
+        c.disconnectFromServer()
+        c.deleteLater()          # 连接对象不释放会跟着新连接一起堆积
         try:
-            cmd = bytes(c.readAll()).decode("utf-8", "ignore").strip()
+            cmd = bytes(data).decode("utf-8", "ignore").strip()
         except Exception:
             cmd = ""
+        if not cmd:
+            # 空包＝探活连接（第二个实例启动、卸载脚本探活都只连不发），什么都不做
+            return
         if cmd == "tidy":
             ctl.tidy(notify=True)
         elif cmd == "undo":
@@ -706,6 +840,8 @@ def run(argv=None):
             ctl.pin_clipboard()
         elif cmd == "win":
             ctl.show_window()
+        elif cmd == "quit":
+            ctl.quit()          # 卸载/升级时让运行中的实例自己优雅退出
         else:
             ctl.show_window()
 

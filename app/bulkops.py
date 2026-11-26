@@ -23,22 +23,39 @@ import shutil
 import time
 import uuid
 
+import atomicio
 import config as appcfg
 import rules
 import sysenv
+from organizer import move_into        # 原子占位的搬运实现，整理和批量操作共用一份
 
 OP_FILE = os.path.join(appcfg.CONFIG_DIR, "ops.jsonl")
 
 
+def _rec_ts(rec):
+    """取一条日志的真实时间戳：优先 ts_num，老日志没有就解析 ts 文本。"""
+    t = rec.get("ts_num")
+    if isinstance(t, (int, float)):
+        return float(t)
+    txt = rec.get("ts") or ""
+    try:
+        return time.mktime(time.strptime(txt, "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def unique_path(dst):
-    """目标重名时生成「名字 (2).ext」，绝不覆盖。"""
-    if not os.path.exists(dst):
+    """目标重名时生成「名字 (2).ext」，绝不覆盖。
+
+    只算名字、不占位；真正落地请用 move_into()（原子占位，没有 TOCTOU 窗口）。
+    """
+    if not os.path.exists(atomicio.win_long(dst)):
         return dst
     base, ext = os.path.splitext(dst)
     i = 2
     while True:
         cand = "%s (%d)%s" % (base, i, ext)
-        if not os.path.exists(cand):
+        if not os.path.exists(atomicio.win_long(cand)):
             return cand
         i += 1
 
@@ -46,12 +63,12 @@ def unique_path(dst):
 def _unique_in(directory, name):
     """回收站里的重名规则是 name / name.2 / name.3（跟 gvfs 保持一致）。"""
     cand = os.path.join(directory, name)
-    if not os.path.exists(cand):
+    if not os.path.exists(atomicio.win_long(cand)):
         return cand
     i = 2
     while True:
         cand = os.path.join(directory, "%s.%d" % (name, i))
-        if not os.path.exists(cand):
+        if not os.path.exists(atomicio.win_long(cand)):
             return cand
         i += 1
 
@@ -131,6 +148,7 @@ class BulkOps(object):
 
         batch = self._new_batch()
         done, failed = [], []
+        hard = 0        # 真正的搬运异常（"本来就不该动"的预检拦截不算）
         for src in paths:
             if self.is_protected(src):
                 failed.append((src, "归档结构目录，不能移动"))
@@ -146,14 +164,48 @@ class BulkOps(object):
                     continue
             dst = unique_path(os.path.join(target_dir, os.path.basename(src)))
             try:
-                shutil.move(src, dst)
+                dst = move_into(src, dst)        # 原子占位 + 搬运，重名绝不覆盖
             except (OSError, shutil.Error) as e:
                 failed.append((src, str(e)))
+                hard += 1
                 continue
-            self._log(batch, "move", src=src, dst=dst)
+            if not self._log(batch, "move", src=src, dst=dst):
+                failed.append((src, "已移动，但撤销日志写入失败，无法撤销"))
+                hard += 1
             done.append((src, dst))
+
+        # 多数项搬不动 → 整批退回。让抽屉停在"搬了一半"的状态，
+        # 用户既数不清哪些进去了，也记不住它们原来在哪。
+        if done and hard and hard * 2 >= len(paths):
+            back, stuck = self._rollback(batch, done)
+            msg = "本批 %d 项搬不动，已整批回滚（%d 项退回原处）" % (hard, back)
+            if stuck:
+                msg += "，其中 %d 项退不回去" % len(stuck)
+            # 结论放最前：UI 只取 failed[0][1] 拼提示
+            failed = [("", msg)] + stuck + failed
+            done = []
         self._invalidate()
         return done, failed
+
+    def _rollback(self, batch, done):
+        """把一批已搬动的项原路退回，并把这一批从撤销日志里抹掉。
+
+        返回 (退回条数, [(路径, 原因), ...])。只要还有退不回去的，日志就留着，
+        用户仍能再撤一次，不会因为回滚不干净把记录丢了。
+        """
+        back, stuck = 0, []
+        for src, dst in reversed(done):
+            try:
+                if dst and os.path.exists(atomicio.win_long(dst)):
+                    move_into(dst, src)          # 原子占位：原位置同名不会被覆盖
+                    back += 1
+            except (OSError, shutil.Error) as e:
+                stuck.append((dst, str(e)))
+        if done and not stuck:
+            recs = [r for r in self.history() if r.get("batch") != batch]
+            lines = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs)
+            appcfg.atomic_write_text(OP_FILE, lines)
+        return back, stuck
 
     # -- 删除（进回收站）----------------------------------------------------
     def trash(self, paths):
@@ -176,7 +228,7 @@ class BulkOps(object):
         batch = self._new_batch()
         done, failed = [], []
         for src in paths:
-            if not os.path.exists(src):
+            if not os.path.exists(atomicio.win_long(src)):
                 failed.append((src, "文件已不存在"))
                 continue
             if self.is_protected(src):
@@ -184,27 +236,27 @@ class BulkOps(object):
                 continue
             name = os.path.basename(src)
             dst = _unique_in(files_dir, name)
-            info = dst + ".trashinfo"
             try:
-                shutil.move(src, dst)
+                dst = move_into(src, dst)        # 原子占位：回收站里同名不会互相覆盖
             except (OSError, shutil.Error) as e:
                 failed.append((src, str(e)))
                 continue
             try:
-                with open(os.path.join(info_dir, os.path.basename(info)),
-                          "w", encoding="utf-8") as f:
-                    f.write("[Trash Info]\nPath=%s\nDeletionDate=%s\n"
-                            % (_quote(src), time.strftime("%Y-%m-%dT%H:%M:%S")))
+                appcfg.atomic_write_text(
+                    os.path.join(info_dir, os.path.basename(dst) + ".trashinfo"),
+                    "[Trash Info]\nPath=%s\nDeletionDate=%s\n"
+                    % (_quote(src), time.strftime("%Y-%m-%dT%H:%M:%S")))
             except OSError:
                 # 写 info 失败也要把文件放回去，否则回收站里会出现无主条目
                 try:
-                    shutil.move(dst, src)
+                    move_into(dst, src)
                 except (OSError, shutil.Error):
                     pass
                 failed.append((src, "回收站信息写入失败"))
                 continue
-            self._log(batch, "trash", src=src, dst=dst,
-                      info=os.path.join(info_dir, os.path.basename(info)))
+            if not self._log(batch, "trash", src=src, dst=dst,
+                             info=os.path.join(info_dir, os.path.basename(dst) + ".trashinfo")):
+                failed.append((src, "已移入回收站，但撤销日志写入失败"))
             done.append((src, dst))
         self._invalidate()
         return done, failed
@@ -230,13 +282,23 @@ class BulkOps(object):
                 op.wFunc = 3                      # FO_DELETE
                 op.pFrom = os.path.abspath(src) + "\0\0"
                 op.fFlags = 0x0040 | 0x0010 | 0x0004   # ALLOWUNDO | NOCONFIRMATION | SILENT
-                if ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) != 0:
-                    failed.append((src, "回收站操作失败"))
+                rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+                # 返回值必须校验，还要看 fAnyOperationsAborted：
+                # 用户点了取消、或文件被占用时，前两者都会是"成功"但实际没进回收站
+                if rc != 0:
+                    failed.append((src, "回收站操作失败（错误码 0x%X）" % (rc & 0xFFFFFFFF)))
+                    continue
+                if op.fAnyOperationsAborted:
+                    failed.append((src, "操作被中途取消"))
+                    continue
+                if os.path.exists(atomicio.win_long(src)):
+                    failed.append((src, "系统未删除该文件（可能被占用）"))
                     continue
             except Exception as e:
                 failed.append((src, str(e)))
                 continue
-            self._log(batch, "trash_win", src=src, dst="")
+            if not self._log(batch, "trash_win", src=src, dst=""):
+                failed.append((src, "已删除，但撤销日志写入失败"))
             done.append((src, ""))
         self._invalidate()
         return done, failed
@@ -267,7 +329,7 @@ class BulkOps(object):
                 continue
             cand = os.path.join(os.path.dirname(p), new_name)
             # 同批里的其它文件会让位，不算冲突
-            if os.path.exists(cand) and os.path.abspath(cand) not in taken:
+            if os.path.exists(atomicio.win_long(cand)) and os.path.abspath(cand) not in taken:
                 cand = unique_path(cand)
             out.append((p, name, os.path.basename(cand), ""))
         return out
@@ -288,17 +350,14 @@ class BulkOps(object):
                     failed.append((src, why))
                 continue
             dst = os.path.join(os.path.dirname(src), newname)
-            if os.path.exists(dst):
-                if os.path.abspath(dst) in moving:
-                    dst = unique_path(dst)
-                else:
-                    dst = unique_path(dst)
             try:
-                os.rename(src, dst)
-            except OSError as e:
+                # 同一批里 A→B、B→C 会互相让位，move_into 的占位能处理这种连环保
+                dst = move_into(src, dst)
+            except (OSError, shutil.Error) as e:
                 failed.append((src, str(e)))
                 continue
-            self._log(batch, "rename", src=src, dst=dst)
+            if not self._log(batch, "rename", src=src, dst=dst):
+                failed.append((src, "已改名，但撤销日志写入失败，无法撤销"))
             done.append((src, dst))
         self._invalidate()
         return done, failed
@@ -311,7 +370,7 @@ class BulkOps(object):
         if name in (".", ".."):
             raise BulkError("文件夹名不合法")
         dst = os.path.join(parent, name)
-        if os.path.exists(dst):
+        if os.path.exists(atomicio.win_long(dst)):
             raise BulkError("「%s」已经存在了" % name)
         try:
             os.makedirs(dst)
@@ -325,14 +384,23 @@ class BulkOps(object):
         return time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     def _log(self, batch, op, **fields):
-        os.makedirs(os.path.dirname(OP_FILE), exist_ok=True)
-        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "batch": batch, "op": op}
+        """追加一条操作记录，返回是否写成功（写不进去就等于撤不回来，必须让用户知道）。"""
+        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "ts_num": time.time(),
+               "batch": batch, "op": op}
         rec.update(fields)
         try:
+            os.makedirs(os.path.dirname(OP_FILE), exist_ok=True)
             with open(OP_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            return False
+        try:
+            atomicio.trim_jsonl(OP_FILE)      # 和 moves.jsonl 一样：超阈值裁老记录
         except OSError:
             pass
+        return True
 
     def history(self):
         if not os.path.isfile(OP_FILE):
@@ -357,7 +425,8 @@ class BulkOps(object):
         recs = self.history()
         if not recs:
             return None
-        batch = recs[-1]["batch"]
+        # 用记录里的真实时间戳判序，不靠行序：日志被手工补写/多进程追加时行序不可信
+        batch = max(recs, key=_rec_ts).get("batch")
         items = [r for r in recs if r.get("batch") == batch]
         label = {"move": "移动", "trash": "删除", "rename": "重命名",
                  "trash_win": "删除"}.get(items[0].get("op"), "操作")
@@ -369,7 +438,7 @@ class BulkOps(object):
         recs = self.history()
         if not recs:
             return None, 0, ""
-        batch = recs[-1]["batch"]
+        batch = max(recs, key=_rec_ts).get("batch")
         items = [r for r in recs if r.get("batch") == batch]
         op = items[0].get("op")
         label = {"move": "移动", "trash": "删除", "rename": "重命名",
@@ -380,45 +449,32 @@ class BulkOps(object):
             return label, 0, "Windows 的删除进了系统回收站，请在回收站里还原"
 
         count = 0
+        errs = []
         for r in reversed(items):
             src, dst = r.get("src"), r.get("dst")
             try:
-                if op == "rename":
-                    if dst and os.path.exists(dst):
-                        back = unique_path(src) if os.path.exists(src) else src
-                        os.rename(dst, back)
-                        count += 1
-                elif op == "move":
-                    if dst and os.path.exists(dst):
-                        back = unique_path(src) if os.path.exists(src) else src
-                        os.makedirs(os.path.dirname(src), exist_ok=True)
-                        shutil.move(dst, back)
-                        count += 1
-                elif op == "trash":
-                    if dst and os.path.exists(dst):
-                        back = unique_path(src) if os.path.exists(src) else src
-                        os.makedirs(os.path.dirname(src), exist_ok=True)
-                        shutil.move(dst, back)
-                        info = r.get("info")
-                        if info and os.path.isfile(info):
-                            os.remove(info)
+                if op in ("rename", "move", "trash"):
+                    if dst and os.path.exists(atomicio.win_long(dst)):
+                        # 原位置若已经又有了同名文件，move_into 会自动改成「名字 (2)」
+                        move_into(dst, src)
+                        if op == "trash":
+                            info = r.get("info")
+                            if info and os.path.isfile(info):
+                                os.remove(info)
                         count += 1
             except (OSError, shutil.Error) as e:
-                note = str(e)
+                errs.append((src or dst or "", str(e)))
                 continue
 
+        if errs:
+            note = "%d 项撤销失败：%s" % (len(errs), errs[0][1])
         if count == 0 and items and not note:
             note = "这些文件已经不在原处了，撤不回来"
 
         # 一条都没撤回来就别删记录 —— 用户把文件挪回去之后还能再撤一次
         keep = recs if count == 0 else [r for r in recs if r.get("batch") != batch]
-        try:
-            os.makedirs(os.path.dirname(OP_FILE), exist_ok=True)
-            with open(OP_FILE, "w", encoding="utf-8") as f:
-                for r in keep:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        except OSError:
-            pass
+        lines = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in keep)
+        appcfg.atomic_write_text(OP_FILE, lines)
         self._invalidate()
         return label, count, note
 
@@ -434,8 +490,15 @@ def undo_latest(org, ops, log_file):
     两套日志各记各的（整理是"桌面→抽屉"单向搬运，批量操作是任意方向的
     用户意图），所以靠文件修改时间判断谁更近。返回 (撤回条数, 提示语)。
     """
-    op_t = os.path.getmtime(OP_FILE) if os.path.isfile(OP_FILE) else 0
-    mv_t = os.path.getmtime(log_file) if log_file and os.path.isfile(log_file) else 0
+    # 判序用日志记录里的真实时间戳，而不是文件 mtime：
+    # 文件被复制/同步/备份还原过 mtime 会整体漂移，ts_num 不会。
+    op_t = max([_rec_ts(r) for r in ops.history()] or [0.0])
+    mv_recs = org.history() if hasattr(org, "history") else []
+    mv_t = max([_rec_ts(r) for r in mv_recs] or [0.0])
+    if not op_t and os.path.isfile(OP_FILE):
+        op_t = os.path.getmtime(OP_FILE)
+    if not mv_t and log_file and os.path.isfile(log_file):
+        mv_t = os.path.getmtime(log_file)
 
     if op_t and op_t >= mv_t:
         label, n, note = ops.undo_last()

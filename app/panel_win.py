@@ -22,6 +22,8 @@ import ctypes
 import sys
 from ctypes import wintypes
 
+import sysenv
+
 IS_WINDOWS = sys.platform.startswith("win")
 
 # ---- AccentState ---------------------------------------------------------- #
@@ -147,6 +149,8 @@ class PanelWin(object):
         self.cfg = cfg
         self._last_hwnds = ()
         self._applied = False
+        self._backed_up = False     # 原值只记一次，别每次贴 accent 都覆盖成"已改过"的值
+        self._transparency_ok = False   # "透明效果"已经确保开启过，不必每次拖滑块都写注册表
 
     # -- 能力 ---------------------------------------------------------------
     def supports_blur_level(self):
@@ -188,13 +192,34 @@ class PanelWin(object):
         except (TypeError, ValueError):
             return 0.6
 
-    def set_alpha(self, value, smooth=False):
+    def set_alpha(self, value, smooth=False, sync_glass=True):
+        # Windows 侧 apply_glass() 就是"把 accent 贴到任务栏"，不调用等于没设置，
+        # 所以这里的 sync_glass 默认 True（与 panel_core 的语义差异是平台差异，不是遗漏）。
         value = max(0.0, min(self.max_alpha(), float(value)))
         self.cfg["general"]["alpha"] = "%.3f" % value
-        self.apply_glass()
+        self.apply_glass()      # 透明度必须落到窗口上，因此不看 sync_glass
         return value
 
     # -- 应用 ---------------------------------------------------------------
+    BACKUP_KEY = "panel_win"
+
+    def _backup_once(self):
+        """动系统「透明效果」之前，把原值记一次，退出时才能写回去。
+
+        读不到（None）就不记：还原时宁可不碰，也不能把用户的设置改成猜的值。
+        """
+        if self._backed_up:
+            return
+        if not sysenv.recall_system(self.BACKUP_KEY):
+            cur = _transparency_enabled()
+            if cur is not None:
+                try:
+                    sysenv.remember_system(self.BACKUP_KEY,
+                                           {"EnableTransparency": 1 if cur else 0})
+                except OSError:
+                    pass        # 台账写不进去不能挡住贴 accent
+        self._backed_up = True
+
     def apply_glass(self):
         """把当前透明度 + 玻璃状态贴到任务栏窗口上。
 
@@ -208,9 +233,18 @@ class PanelWin(object):
             return False, "找不到任务栏窗口（Shell_TrayWnd）"
 
         if self.glass_on():
-            _enable_transparency(True)
+            self._backup_once()
+            # 拖滑块时 apply_glass 会被反复调用，写注册表只做一次：
+            # 系统设置项没变，重复写只是白白触发 explorer 的变更通知。
+            if not self._transparency_ok:
+                self._transparency_ok = bool(_enable_transparency(True))
 
         alpha = self.get_alpha()
+        if self.glass_on() and alpha > GLASS_MAX_ALPHA:
+            # 玻璃质感开着时透明度不能顶到 100%，否则就是一块实心色块。
+            # 这里联动收回来，配置文件里存的旧值也一起修正。
+            alpha = GLASS_MAX_ALPHA
+            self.cfg["general"]["alpha"] = "%.3f" % alpha
         if self.glass_on():
             state = ACCENT_ENABLE_ACRYLICBLURBEHIND
         else:
@@ -271,13 +305,21 @@ class PanelWin(object):
         return True
 
     def restore(self):
-        """恢复系统默认外观。"""
+        """还原系统外观：摘掉我们贴的 accent，并把「透明效果」写回原来的值。"""
         for h in _taskbars():
             try:
                 _set_accent(h, ACCENT_DISABLED, 0)
             except Exception:
                 pass
         self._applied = False
+
+        saved = sysenv.recall_system(self.BACKUP_KEY) or {}
+        if "EnableTransparency" in saved:
+            _enable_transparency(bool(saved["EnableTransparency"]))
+            sysenv.forget_system(self.BACKUP_KEY)
+            self._backed_up = False
+        self._transparency_ok = False       # 下次开启玻璃时重新确认一次
+        return True
 
 
 def preset_value(key):

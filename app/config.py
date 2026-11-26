@@ -5,6 +5,7 @@
 import configparser
 import os
 
+import atomicio
 import sysenv
 
 CONFIG_DIR = sysenv.config_dir()
@@ -20,6 +21,9 @@ DEFAULTS = {
     # 文件
     "auto_tidy": "0",         # 默认不自动整理，靠"一键整理"
     "min_age": "3",           # 3 秒内刚写过的文件不动
+    # Windows 公共桌面（C:\Users\Public\Desktop）默认不整理：它是系统级目录，
+    # 搬走会影响本机其它账号，写回权限也不一定还在（详见 sysenv.desktop_dirs）
+    "public_desktop": "0",
     # 界面
     "tray_start": "1",        # 启动直接进托盘
     "show_edge": "1",         # 屏幕右侧入口条
@@ -65,14 +69,25 @@ def load():
         cfg["general"]["pin_hotkey"] = "F3"
         cfg["general"]["pin_toggle_hotkey"] = "<Shift>F3"
         cfg["general"]["hotkey_scheme"] = "snipaste"
-        cfg._needs_save = True
+        save(cfg)       # 迁移结果立刻落盘，否则下次启动会反复迁移、覆盖用户改过的键位
     return cfg
 
 
+def atomic_write_text(path, text):
+    """原子写文本：先写同目录的 .tmp，再 os.replace 顶上。
+
+    实现在 atomicio 里（平台层也要用，放这里会和 sysenv 形成循环导入）：
+    断电/崩溃只会留下一个孤立的 .tmp，不会被截断的 config.ini 或撤销日志，
+    读端永远不会读到"写了一半"的文件。返回是否成功。
+    """
+    return atomicio.atomic_write_text(path, text)
+
+
 def save(cfg):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        cfg.write(f)
+    import io
+    buf = io.StringIO()
+    cfg.write(buf)
+    return atomic_write_text(CONFIG_FILE, buf.getvalue())
 
 
 def get(cfg, key, default=None):

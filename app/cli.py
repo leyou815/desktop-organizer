@@ -30,6 +30,7 @@ import rules
 import sysenv
 from organizer import Organizer
 from panel_core import get_backend, PanelError, PRESETS
+from version import VERSION
 
 
 def _ctx():
@@ -38,15 +39,21 @@ def _ctx():
 
 
 def cmd_scan():
-    _, org, _ = _ctx()
-    pend = org.scan_pending(min_age=0)
+    cfg, org, _ = _ctx()
+    # 和 tidy 用同一套口径（含 min_age）：预览项数必须等于真整理会搬的项数，
+    # 否则"预览有 3 项、点整理只搬走 2 项"会让用户以为程序漏了东西。
+    pend = org.scan_pending()
     if not pend:
         print("桌面很干净，没有需要归类的文件。")
         return 0
     print("待归类 %d 项（只是预览，没有移动任何东西）：\n" % len(pend))
     for src, cat, sub in pend:
         print("  %-46s → %s" % (os.path.basename(src), (cat + "/" + sub).rstrip("/")))
-    print("\n执行整理：zhengli tidy")
+    min_age = cfg["general"].get("min_age", "3")
+    roots = sysenv.desktop_dirs(include_public=appcfg.flag(cfg, "public_desktop"))
+    print("\n口径：%s 秒内刚写过的文件跳过；扫描 %d 个桌面目录%s"
+          % (min_age, len(roots), "（含公共桌面）" if len(roots) > 1 else ""))
+    print("执行整理：zhengli tidy")
     return 0
 
 
@@ -198,7 +205,7 @@ def cmd_glass(state):
 
 def cmd_diagnose():
     cfg, org, pnl = _ctx()
-    print("== 桌面整理 %s ==" % "1.0")
+    print("== 桌面整理 %s ==" % VERSION)
     print("桌面目录    %s" % org.desktop)
     print("归档目录    %s" % org.root)
     print("-- 任务栏 --")
@@ -207,9 +214,13 @@ def cmd_diagnose():
     print("-- 文件 --")
     print("  待整理   %d" % org.pending_count())
     print("  已归档   %d" % org.total())
-    print("  最近批次 %s" % (org.last_batch_info() or "无"))
+    # last_batch_info 返回的是 (批次号, 条数) 元组：不能直接塞进 % 里（会被当成多个参数）
+    info = org.last_batch_info()
+    print("  最近批次 %s" % ("%s（%d 项）" % info if info else "无"))
     print("-- 其它 --")
     print("  自启     %s" % ("开" if sysenv.autostart_on() else "关"))
+    print("  公共桌面 %s" % ("已纳入整理" if appcfg.flag(cfg, "public_desktop")
+                            else "未纳入（设置里可打开）"))
     return 0
 
 
