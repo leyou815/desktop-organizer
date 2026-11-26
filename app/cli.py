@@ -13,6 +13,7 @@
   zhengli snipcopy       截图并直接复制
   zhengli snipkeys on|off 截图快捷键总开关（关掉后 F1/F2/F3 归还给其它程序）
   zhengli panel 55       任务栏透明度设为 55%
+  zhengli autohide on   任务栏自动隐藏（仅 Windows，图标零损失）
   zhengli glass on|off   玻璃质感开关
   zhengli diagnose       环境诊断
   zhengli autostart on|off
@@ -177,6 +178,13 @@ def cmd_stat():
 
 def cmd_panel(value):
     cfg, _, pnl = _ctx()
+    # 自动隐藏和整窗淡出互斥：命令行显式设了透明度，就理解为要回淡出模式，
+    # 否则写进去的数值会被 autohide 模式直接忽略，看起来像"设了没反应"。
+    try:
+        if pnl.taskbar_mode() != pnl.MODE_FADE:
+            pnl.set_taskbar_mode(pnl.MODE_FADE)
+    except Exception:
+        pass
     try:
         v = pnl.set_alpha(float(value) / 100.0)
     except PanelError as e:
@@ -187,6 +195,21 @@ def cmd_panel(value):
     print("任务栏透明度 %d%%%s" % (int(v * 100),
                                 "（上限 %d%%）" % int(round(cap * 100))
                                 if cap < 1.0 else ""))
+    return 0
+
+
+def cmd_autohide(value):
+    """切换任务栏形态。Windows 上这是唯一能做到"图标零损失"的办法。"""
+    cfg, _, pnl = _ctx()
+    if not pnl.supports_autohide():
+        print("当前平台没有这个选项（麒麟用 panel 命令直接调透明度）")
+        return 2
+    pnl.set_taskbar_mode(pnl.MODE_AUTOHIDE if value == "on" else pnl.MODE_FADE)
+    appcfg.save(cfg)
+    if value == "on":
+        print("任务栏已设为自动隐藏（鼠标碰底边才出来）")
+    else:
+        print("任务栏恢复常驻，透明度 %d%%" % int(round(pnl.get_alpha() * 100)))
     return 0
 
 
@@ -258,6 +281,8 @@ def main(argv):
     sub.add_parser("diagnose", help="环境诊断")
     sp = sub.add_parser("panel", help="设置任务栏透明度（0-100）")
     sp.add_argument("value", type=float)
+    sp = sub.add_parser("autohide", help="任务栏自动隐藏 on/off（仅 Windows）")
+    sp.add_argument("state", choices=["on", "off"])
     sp = sub.add_parser("glass", help="玻璃质感 on/off")
     sp.add_argument("state", choices=["on", "off"])
     sp = sub.add_parser("autostart", help="开机自启 on/off")
@@ -291,6 +316,8 @@ def main(argv):
         return cmd_stat()
     if args.cmd == "panel":
         return cmd_panel(args.value)
+    if args.cmd == "autohide":
+        return cmd_autohide(args.state)
     if args.cmd == "glass":
         return cmd_glass(args.state)
     if args.cmd == "diagnose":

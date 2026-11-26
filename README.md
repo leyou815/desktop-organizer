@@ -11,44 +11,58 @@
 
 ## 功能
 
-### 1. 任务栏透明度
+### 1. 任务栏外观
 
 **麒麟**：滑块 0–100%，写 `gsettings`，**背景真透明、图标清晰**，改完立刻生效。
 
-**Windows**：滑块 55%–100%，控制的是**整窗不透明度** —— 任务栏会连图标和文字一起变淡。
-这是平台限制，不是没调好，下面有实测数据。
+**Windows**：两种形态，二选一（互斥，切换时自动把另一种摘干净）
+
+| 形态 | 效果 | 代价 |
+|---|---|---|
+| **自动隐藏**（推荐） | 整条让位给壁纸，鼠标碰底边才滑出来 | 无，图标零损失，系统原生、随时可逆 |
+| **整窗淡出**（55%–100%） | 能透出桌面 | 图标与文字等比一起变淡 |
 
 - 四档预设：浓雾 / 磨砂 / 玻璃 / 通透
 - 实时预览卡：把"任务栏叠在壁纸上"的样子画出来，拖滑块即时可见
+- 检测到 TranslucentTB 正在运行时会给出提示：两者改的是同一块任务栏，同时开启会互相覆盖
 
-> **为什么 Windows 做不到「背景透、图标清晰」**
+> **为什么 Windows 上纯外部程序做不到「背景透、图标清晰」**
 >
-> TranslucentTB 那个效果靠的是**注入 explorer 进程**（Detour + `SetWindowsHookEx`），
-> 在系统进程内部改渲染。本工具是纯 Python，不做注入 —— 杀软会拦，崩了会带崩整个桌面。
+> 读过 TranslucentTB 的源码（`ExplorerTAP/taskbarappearanceservice.cpp`）：
+> 它注入 explorer 后，拿到任务栏背景那个 XAML `Shape`，直接 `Fill(newBrush)` 换掉画刷，
+> 并 `SetWindowSubclass` 任务栏窗口在 `WM_PAINT` 里涂黑客户区。这些动作全部发生在
+> **explorer 进程内部**，外部调用 `SetWindowCompositionAttribute` 完全没有机会参与。
+> 它是签过名的开源项目（`ExplorerTAP` + `ExplorerHooks` 两个注入 DLL），所以杀软不拦；
+> 纯 Python 复刻不了这条路径（要 C++ DLL + COM proxy/stub + WinRT XAML 访问 + 代码签名）。
 >
-> 在 Win11 10.0.26200（25H2）上，外部能试的路都试过了，任务栏背景亮度一律只动 1–2 级：
+> Win11 10.0.26200（25H2）实测，外部能试的路全部无效 —— 取样任务栏
+> 2560×60 物理像素，用均亮度 / 标准差 / 图标对比度三个指标卡：
 >
 > | 尝试 | 结果 |
 > |---|---|
-> | `SetWindowCompositionAttribute`：state 1/2/3/4/5 × alpha 0~255 | 32.5 → 34.5，等于没动 |
+> | `SetWindowCompositionAttribute`：AccentState 0~5 × alpha 0/128/255 | 仅 state 2 拉动 4 级（37.32→41.57），其余零变化 |
 > | `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE = 2/3/4)` | HRESULT=0，零变化 |
+> | `DwmEnableBlurBehindWindow` | 38.09 → 39.68，噪声级 |
 > | 注册表 `TaskbarAcrylicOpacity`（0 / 200，各重启一次 explorer） | 零变化 |
-> | 对 XAML 子窗口 `DesktopWindowContentBridge` 单独贴 accent | 零变化 |
+> | 色键透明（`WS_EX_LAYERED` + `LWA_COLORKEY`） | 零变化，DComp 内容不走重定向表面 |
+> | 隐藏 XAML 子窗口 `DesktopWindowContentBridge` | 整条变纯色 103、标准差 0.00、图标对比度 0.0 |
 >
-> 根因：Win11 的任务栏背景由 explorer 的 XAML 层自己绘制，外部合成层打不穿。
-> Win10（build < 22000）上 AccentPolicy 的 alpha 仍然有效，代码里保留了那条分支，
-> 在 Win10 上依然是「背景透、图标清晰」。
+> 最后一行是关键：图标和背景在**同一个视觉树**里，隐藏背景层连图标一起消失，
+> 所以"只摘背景"这条路从进程外不存在。
 >
-> **整窗透明的实测代价**（深色主题、任务栏背后是深色壁纸，最坏情况）：
+> **AccentState 常量容易记错**（TranslucentTB 的 `Common/undoc/user32.hpp`）：
+> `1 = GRADIENT`（alpha 被忽略）、`2 = TRANSPARENTGRADIENT`（Clear，用 alpha）、
+> `3 = BLURBEHIND`、`4 = ACRYLICBLURBEHIND`。网上很多资料把 2 写成 blur，会试错一轮。
+>
+> 另外两条实测数据，供判断"淡出"值不值：
 >
 > | 不透明度 | 任务栏背景亮度 | 图标对比度 |
 > |---|---|---|
-> | 100%（系统原样） | 33.0 | 61.4 |
-> | 80% | 29.2 | 49.1 |
-> | 55%（下限） | 24.3 | 33.7 |
+> | 100%（系统原样） | 37.3 | 31.0 |
+> | 80% | 33.5 | 24.2 |
+> | 55%（下限） | 约 24 | 约 21 |
 >
-> 图标掉 45%，背景只透出 27%，所以下限设在 55%。想更干净的话，把任务栏设为
-> **自动隐藏**（系统原生、随时可逆）比"淡出"有效得多。
+> 图标掉约三成、背景只透出一点点 —— 所以把自动隐藏放在前面推荐。
 
 ![任务栏](assets/main-panel.png)
 
@@ -129,7 +143,7 @@
 
 | 能力 | 麒麟 V10 SP1（UKUI） | Windows 11（10.0.26200） |
 |---|---|---|
-| 任务栏透明度 | `gsettings` 三键（0~100%），背景真透明图标清晰 | Win11 只能整窗 layered（55%~100%）；Win10 走 accent，可做到背景透、图标清晰 |
+| 任务栏透明度 | `gsettings` 三键（0~100%），背景真透明图标清晰 | 自动隐藏（推荐）或整窗淡出 55%~100%；Win10 走 accent，可做到背景透、图标清晰 |
 | 桌面文件整理 | ✅ 已实测 | 逻辑平台无关，自检通过（未做真实整理） |
 | 抽屉 / 搜索 / 托盘 | ✅ 已实测 | 托盘可用性自检通过 |
 | 桌面图标（应用） | `.desktop` | `.lnk` / `.url`（图标读取已实测） |
@@ -449,7 +463,7 @@ UI（`ui_main.py` / `ui_drawer.py`）完全平台无关。
 
 | 关注点 | 麒麟 | Windows |
 |---|---|---|
-| 任务栏透明度 | `org.ukui.control-center.personalise:transparency`（0~1），写入实时生效 | Win11：`WS_EX_LAYERED` + `SetLayeredWindowAttributes`（140~255）；Win10：`ACCENT_POLICY` 的 alpha（0~255） |
+| 任务栏透明度 | `org.ukui.control-center.personalise:transparency`（0~1），写入实时生效 | 形态二选一：`SHAppBarMessage(ABM_SETSTATE)` 自动隐藏，或 `WS_EX_LAYERED` + `SetLayeredWindowAttributes` 整窗 alpha（140~255）；Win10 另有 `ACCENT_POLICY` 的 alpha（0~255） |
 | 磨砂强度 | `personalise:blurry` 有低/中/高三档 | 无对应概念，该行控件在 Windows 上自动隐藏 |
 | 玻璃质感开关 | `effect=true`、`enabled-global-blur=true`、`blurry` 三项每次重写 | **自动隐藏**：任务栏的磨砂由系统「透明效果」统一控制，这个开关按了没有可见变化 |
 | 任务栏窗口 | QML 面板，改键即刷新 | `Shell_TrayWnd` + `Shell_SecondaryTrayWnd`；资源管理器重启后句柄失效，句柄变了重设，layered 位被冲掉也补回 |
@@ -463,8 +477,10 @@ UI（`ui_main.py` / `ui_drawer.py`）完全平台无关。
 它打不穿 XAML 层 —— state 1/2/3/4/5 配任意 alpha，背景亮度只动 1~2 级；
 `DWMWA_SYSTEMBACKDROP_TYPE` 和注册表 `TaskbarAcrylicOpacity` 同样无效。
 
-所以 Win11 只用 `WS_EX_LAYERED` + `SetLayeredWindowAttributes` 做整窗不透明度：
-线性可逆、退出时把扩展样式原样还回去；代价是图标文字等比变淡，下限因此设在 55%。
+所以 Win11 给了两种形态，都不碰背景本身：
+**自动隐藏**（`ABM_SETSTATE`，整条让位给壁纸，图标零损失，实测即时生效、可逆）和
+**整窗淡出**（`WS_EX_LAYERED` + `SetLayeredWindowAttributes`，线性可逆、退出时把扩展样式
+原样还回去；代价是图标文字等比变淡，下限因此设在 55%）。两者互斥，切换时自动摘干净另一种。
 Win10（build < 22000）保留 accent 分支，那边 alpha 真的有效，只压背景不动图标。
 
 ## 验证情况
@@ -523,10 +539,17 @@ Win10（build < 22000）保留 accent 分支，那边 alpha 真的有效，只�
 > 顺带：Windows 上那个按了没有可见变化的「玻璃质感」开关自动隐藏；滑块范围和显示值
 > 跟着后端真实上下限走，不会再出现"数字 0% 但滑块停在 10%"。
 
+> **v1.0.4 把这件事查到底了**：读 TranslucentTB 源码确认，它的真透明是在 explorer
+> 进程内换掉任务栏背景 XAML `Shape` 的 `Fill`，外部 API 够不着。所以 Windows 侧改成
+> 两种形态二选一 —— 新增「自动隐藏」（`ABM_SETSTATE`，图标零损失），保留「整窗淡出」，
+> 并检测 TranslucentTB 等第三方工具避免互相覆盖。测量方法也修了：之前有几个实验脚本
+> 没做 DPI 感知，取样落在了壁纸上，读数当然不动；对齐物理像素后数据才可信。
+
 ## 已知限制
 
-1. **Windows 的任务栏透明度靠分层窗口实现**，图标和文字会跟着一起变淡（整窗混合的必然结果），
-   所以下限 10%；拖到 10% 时字会有点糊，是机制代价，不是 bug。
+1. **Windows 的"整窗淡出"会连图标文字一起变淡**（整窗混合的必然结果），下限 55%；
+   想要"背景透、图标实"，请用自动隐藏，或者装 TranslucentTB —— 它靠注入 explorer 实现，
+   本工具不注入。
 2. Windows 没有"磨砂强度"分级，也没有可用的"玻璃质感"开关（按了没有可见变化），这两行控件会自动隐藏。
 3. 文件分类靠扩展名，改了后缀会归错（文件夹按目录判断，快捷方式按类型判断，不受影响）。
 4. 「此电脑 / 回收站 / 主目录」不是文件，只能靠系统开关隐藏，无法真正归档。
@@ -535,8 +558,8 @@ Win10（build < 22000）保留 accent 分支，那边 alpha 真的有效，只�
 7. **截图只覆盖鼠标所在的那块屏幕**。多屏时不能跨屏拖一个选区——真要做需要多窗口联动，复杂度不值得。
 8. **桌面特效关闭时截出来可能是黑的**（拿不到桌面背景）。程序会提示，但不会替你打开特效。
 9. 截图复制到剪贴板依赖系统的剪贴板管理器（麒麟自带）。如果主程序退出后剪贴板内容消失，说明系统没有常驻管理器。
-10. **Windows 的透明度是整窗 alpha，不是"只透背景"**：用 layered 窗口做，图标/文字一起变淡，
-    下限 10%。想要"背景透、图标实"需要在资源管理器里做注入，风险和复杂度都不划算。
+10. **Windows 做不到"只透背景"**：任务栏背景和图标在 explorer 的同一个 XAML 视觉树里，
+    外部程序改不动（实测隐藏背景层连图标一起消失）。可用手段只有自动隐藏与整窗淡出两种。
 11. **公共桌面（`C:\Users\Public\Desktop`）默认不整理**：系统级目录，搬走影响其它账号、写回权限不保证。
     需要时在 设置 →「整理公共桌面快捷方式」里打开，程序会先探写权限再动手。
 

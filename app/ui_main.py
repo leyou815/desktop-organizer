@@ -392,20 +392,20 @@ class MainWindow(QWidget):
         head = QHBoxLayout()
         box = QVBoxLayout()
         box.setSpacing(1)
-        t = QLabel("任务栏透明度")
+        t = QLabel("任务栏外观" if sysenv.IS_WINDOWS else "任务栏透明度")
         t.setFont(pal.font_ui(17, bold=True))
         t.setStyleSheet("color:%s;" % pal.text.name())
-        # Windows 上这个滑块实际控制的是任务栏底色明度（Acrylic 的 alpha 无效），
-        # 方向是"数值越大越深越实"，和麒麟的 gsettings 透明度不完全一样，
-        # 所以提示文案按平台分开写，别让用户按错方向找半天。
+        # 文案按平台分开写，且不粉饰：Win11 的任务栏背景是 explorer 内部的 XAML
+        # 表面，外部程序碰不到（TranslucentTB 是靠注入 explorer 才做到的）。
+        # 这里把两条真能用的路摆在前面，用户才不会反复拖滑块找那种"背景透、
+        # 图标清晰"的效果——那个效果本工具给不了。
         if sysenv.IS_WINDOWS:
-            # 实测：Win11 任务栏背景由 explorer 的 XAML 层绘制，外部改不动；
-            # 只能整窗半透明，图标会跟着变淡。这句必须说清楚，否则用户会觉得"没调好"。
-            sub_text = ("拖低会透出桌面，但 Windows 只能整窗混合，图标与文字会一起变淡；"
-                        "最低 %d%% 保住可读性" % int(round(self.app.panel.min_alpha() * 100)))
+            sub_text = ("Windows 改不了任务栏背景本身，只能二选一：\n"
+                        "自动隐藏，或整窗淡出")
         else:
             sub_text = "拉低就透出壁纸，磨砂质感始终保留"
         sub = QLabel(sub_text)
+        sub.setWordWrap(True)
         sub.setFont(pal.font_mono(10))
         sub.setStyleSheet("color:%s;" % pal.muted.name())
         box.addWidget(t)
@@ -417,6 +417,34 @@ class MainWindow(QWidget):
         self.pct.setStyleSheet("color:%s;" % pal.accent.name())
         head.addWidget(self.pct)
         lay.addLayout(head)
+
+        # 自动隐藏（Windows 独有）：这是外部程序唯一能做到"图标零损失"的办法
+        self.autohide_row = QWidget()
+        self.autohide_row.setStyleSheet("background:transparent;")
+        r0 = QHBoxLayout(self.autohide_row)
+        r0.setContentsMargins(0, 0, 0, 0)
+        r0t = QVBoxLayout()
+        r0t.setSpacing(1)
+        a0 = QLabel("自动隐藏任务栏")
+        a0.setStyleSheet("color:%s;font-size:13px;font-weight:600;" % pal.text.name())
+        b0 = QLabel("整条让给壁纸，鼠标碰到屏幕底边才滑出来；图标零损失，随时可关")
+        b0.setWordWrap(True)
+        b0.setStyleSheet("color:%s;font-size:10.5px;" % pal.muted.name())
+        r0t.addWidget(a0)
+        r0t.addWidget(b0)
+        r0.addLayout(r0t, 1)
+        self.sw_autohide = Switch(pal)
+        self.sw_autohide.toggled.connect(self._on_autohide)
+        r0.addWidget(self.sw_autohide, 0, Qt.AlignTop)
+        lay.addWidget(self.autohide_row)
+        self.autohide_row.setVisible(self.app.panel.supports_autohide())
+
+        # 下面这一组是"整窗淡出"：自动隐藏开着时整组收起，两套机制不叠加
+        self.fade_box = QWidget()
+        self.fade_box.setStyleSheet("background:transparent;")
+        fb = QVBoxLayout(self.fade_box)
+        fb.setContentsMargins(0, 6, 0, 0)
+        fb.setSpacing(10)
 
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, 100)
@@ -433,7 +461,7 @@ class MainWindow(QWidget):
         """ % (pal.line.name(), pal.accent.name()))
         self.slider.valueChanged.connect(self._on_slider)
         self.slider.sliderReleased.connect(self._commit_alpha)   # 松手立刻落盘，不等防抖
-        lay.addWidget(self.slider)
+        fb.addWidget(self.slider)
 
         chips = QHBoxLayout()
         chips.setSpacing(8)
@@ -447,10 +475,11 @@ class MainWindow(QWidget):
             b.clicked.connect(lambda _=False, v=val: self._on_preset(v))
             self.chips[key] = b
             chips.addWidget(b)
-        lay.addLayout(chips)
+        fb.addLayout(chips)
 
         self.preview = GlassPreview(pal)
-        lay.addWidget(self.preview)
+        fb.addWidget(self.preview)
+        lay.addWidget(self.fade_box)
 
         # 玻璃质感
         self.glass_row = QWidget()
@@ -472,6 +501,14 @@ class MainWindow(QWidget):
         self.sw_glass.toggled.connect(self._on_glass)
         row1.addWidget(self.sw_glass, 0, Qt.AlignTop)
         lay.addWidget(self.glass_row)
+
+        # 和第三方任务栏工具（TranslucentTB 等）抢同一块任务栏，只能二选一
+        self.tools_hint = QLabel("")
+        self.tools_hint.setWordWrap(True)
+        self.tools_hint.setFont(pal.font_mono(9.5))
+        self.tools_hint.setStyleSheet("color:%s;" % pal.accent.name())
+        self.tools_hint.setVisible(False)
+        lay.addWidget(self.tools_hint)
 
         # 磨砂强度（Windows 只有系统 Acrylic 一档，整行不显示）
         self.blur_row = QWidget()
@@ -496,9 +533,14 @@ class MainWindow(QWidget):
         lay.addWidget(self.blur_row)
         lay.addSpacing(4)
         if sysenv.IS_WINDOWS:
-            lay.addWidget(self._hint_card(
-                "任务栏由系统「亚克力」合成。没有变化时先确认：设置 → 个性化 → 颜色 → "
-                "透明效果 处于开启状态；资源管理器重启后程序会在几秒内自动重新贴一次。"))
+            # 旧文案说"由亚克力合成"，实测在 Win11 上不成立（AccentPolicy 对
+            # 任务栏 XAML 表面无效）。改成与实现一致的说明，避免误导排查方向。
+            self.win_hint = self._hint_card(
+                "Windows 的任务栏背景由系统自己绘制，外部程序改不动它 —— 这也是"
+                "TranslucentTB 需要注入 explorer 才能做到真透明的原因。本工具用两条"
+                "可逆的路代替：自动隐藏（整条让位给壁纸，图标无损）或整窗淡出"
+                "（能透出桌面，但图标与文字一起变淡）。退出程序会自动还原。")
+            lay.addWidget(self.win_hint)
         else:
             lay.addWidget(self._hint_card(
                 "磨砂由系统合成器（ukui-kwin）渲染。任务栏没变化时先确认两件事："
@@ -920,6 +962,7 @@ class MainWindow(QWidget):
         # Windows 上"玻璃质感"这个开关没有可见效果（系统磨砂由透明效果开关控制），
         # 藏起来，别留一个按了没反应的开关。
         self.glass_row.setVisible(not sysenv.IS_WINDOWS)
+        self._apply_mode_ui()
         lv = self.app.panel.blur_level()
         for k, b in self.blur_btns.items():
             b.setChecked(k == lv)
@@ -1066,6 +1109,46 @@ class MainWindow(QWidget):
         self.slider.blockSignals(False)
         self._sync_panel(val)
         self._commit_alpha()
+
+    def _on_autohide(self, on):
+        """自动隐藏与整窗淡出互斥：切过去之前先把对方的痕迹摘干净。"""
+        try:
+            self.app.panel.set_taskbar_mode(
+                self.app.panel.MODE_AUTOHIDE if on else self.app.panel.MODE_FADE)
+            self.app.save_cfg()
+            if not on:
+                # 关掉自动隐藏后回到淡出模式，滑块的值原样恢复
+                self._apply_slider_range()
+                self._sync_panel(self.app.panel.get_alpha())
+            self._apply_mode_ui()
+            self.panel_status.setText(
+                "任务栏已设为自动隐藏：鼠标碰到屏幕底边才会滑出来" if on
+                else "任务栏已恢复常驻，外观由下面的滑块控制")
+        except Exception as e:
+            self.panel_status.setText("设置失败：%s" % e)
+
+    def _apply_mode_ui(self):
+        """按当前实际状态同步界面：开关位置、淡出组是否可见、第三方工具提示。"""
+        try:
+            auto = bool(self.app.panel.get_autohide()) if self.app.panel.supports_autohide() else False
+        except Exception:
+            auto = False
+        if hasattr(self, "sw_autohide"):
+            self.sw_autohide.set_silent(auto)
+        if hasattr(self, "fade_box"):
+            self.fade_box.setVisible(not auto)
+        if hasattr(self, "pct"):
+            self.pct.setVisible(not auto)
+        if hasattr(self, "tools_hint"):
+            try:
+                tools = self.app.panel.running_taskbar_tools()
+            except Exception:
+                tools = []
+            if tools:
+                self.tools_hint.setText(
+                    "检测到 %s 正在运行：它和本工具改的是同一块任务栏，同时启用会互相覆盖"
+                    % "、".join(tools))
+            self.tools_hint.setVisible(bool(tools))
 
     def _on_glass(self, on):
         self.app.panel.set_glass(on)

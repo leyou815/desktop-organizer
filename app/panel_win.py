@@ -4,30 +4,40 @@
 桌面整理 —— Windows 任务栏后端
 
 ⚠️ 实测结论（Windows 11 10.0.26200 / 25H2，2026-11-26 复核）
-任务栏背景由 explorer 的 XAML 层自己绘制，外部进程改不动。以下全部实测无效，
-任务栏背景亮度波动 ≤2 级（等于纹丝不动）：
-  - SetWindowCompositionAttribute：AccentState 1/2/3/4/5 × alpha 0~255
+任务栏背景由 explorer 的 XAML 层自己绘制，外部进程改不动。以下全部实测无效
+（取样任务栏 2560x60 物理像素，均亮度/标准差/图标对比度三指标都不动）：
+  - SetWindowCompositionAttribute：AccentState 0~5 × alpha 0/128/255
+    （注意：官方未公开常量表里 1=GRADIENT、2=TRANSPARENTGRADIENT、
+      3=BLURBEHIND、4=ACRYLICBLURBEHIND，2 才是 TranslucentTB 的 Clear）
+    贴上去只有 2 号状态能拉动 4 级（37.32 → 41.57），其余纹丝不动
   - DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE = 2/3/4)：HRESULT=0 但无变化
   - 注册表 TaskbarAcrylicOpacity：重启 explorer 后依然无变化
-  - 对 XAML 子窗口 DesktopWindowContentBridge 单独贴 accent
-TranslucentTB 能做到「背景透明 + 图标清晰」，是因为它注入 explorer 进程后在内部
-改渲染（Detour + SetWindowsHookEx），不是外部 API 调用；纯 Python 无法复刻。
+  - 隐藏 XAML 子窗口 DesktopWindowContentBridge：整条任务栏变成纯色 103，
+    标准差 0.00、图标对比度 0.0 —— 图标和背景是同一个视觉树，拆不开
+  - 色键透明（WS_EX_LAYERED + LWA_COLORKEY）：无变化，DComp 内容不走重定向表面
 
-所以本后端在 Win11 上只提供一种真实可控的手段：
-  WS_EX_LAYERED + SetLayeredWindowAttributes —— 整窗不透明度。
-代价：图标与文字会跟着等比变淡，这是整窗合成的物理结果，不是 bug。
+TranslucentTB 能做到「背景透明 + 图标清晰」，源码（ExplorerTAP）显示它注入
+explorer 后拿到任务栏背景那个 XAML Shape，直接换掉 Fill 画刷，并 subclass
+任务栏窗口在 WM_PAINT 里涂黑客户区 —— 全部发生在 explorer 进程内部。
+它是签过名的知名项目，所以杀软不拦；但纯 Python 复刻不了这条路径
+（需要 C++ DLL + COM proxy/stub + WinRT XAML 访问 + 代码签名）。
+
+因此 Win11 上外部真正可达的只有两条：
+  A. 自动隐藏（推荐）：系统原生，整条让位给壁纸，图标零损失，可逆
+  B. WS_EX_LAYERED 整窗不透明度：能透出桌面，但图标与文字等比变淡
 
 Win10（build < 22000）上 AccentPolicy 的 alpha 仍然有效，走 accent 分支，
-可以做到「背景透、图标清晰」；Win11 才被迫退回整窗方案。
+可以做到「背景透、图标清晰」；Win11 才被迫走上面两条。
 
 流程：
   1. 确保「设置 → 个性化 → 颜色 → 透明效果」是开的（EnableTransparency=1）
   2. FindWindow("Shell_TrayWnd") 拿主任务栏，再枚举 Shell_SecondaryTrayWnd 拿副屏
-  3. Win11：设 layered 不透明度；Win10：下发 ACCENT_POLICY 的 alpha
+  3. 按 taskbar_mode 分流：autohide 走 SHAppBarMessage；fade 走 layered / accent
   4. 资源管理器重启后窗口句柄会变，定期复查句柄，变了就重新贴
 """
 
 import ctypes
+import os
 import sys
 from ctypes import wintypes
 
@@ -136,6 +146,81 @@ MIN_ALPHA_WIN11 = 0.55  # Win11 整窗混合的下限：再低图标与文字就
 MIN_ALPHA = 0.0         # Win10 走 accent 的 alpha，0 = 背景全透、图标依然清晰
 
 
+# -- 自动隐藏 -------------------------------------------------------------
+# Win11 的任务栏是一整块 XAML 表面（背景与图标在同一个视觉树里，外部拆不开），
+# 所以"背景透、图标清晰"从进程外做不到。真正零损耗的替代是系统自带的自动隐藏：
+# 整条让位给壁纸，鼠标碰到底边才滑出来。实测同一条命令即时生效、可逆。
+ABM_GETSTATE = 4
+ABM_SETSTATE = 10
+ABS_AUTOHIDE = 0x1
+ABS_ALWAYSONTOP = 0x2
+
+
+class APPBARDATA(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+                ("uCallbackMessage", wintypes.UINT), ("uEdge", wintypes.UINT),
+                ("rc", wintypes.RECT), ("lParam", wintypes.LPARAM)]
+
+
+def _appbar(state=None):
+    """state 为 None 时只读取当前状态，否则下发 ABM_SETSTATE。"""
+    bar = _taskbars()
+    if not bar:
+        return None
+    abd = APPBARDATA()
+    abd.cbSize = ctypes.sizeof(APPBARDATA)
+    abd.hWnd = bar[0]
+    shell32 = ctypes.windll.shell32
+    shell32.SHAppBarMessage.restype = ctypes.c_size_t
+    shell32.SHAppBarMessage.argtypes = [wintypes.DWORD, ctypes.POINTER(APPBARDATA)]
+    if state is None:
+        return int(shell32.SHAppBarMessage(ABM_GETSTATE, ctypes.byref(abd)))
+    abd.lParam = state
+    shell32.SHAppBarMessage(ABM_SETSTATE, ctypes.byref(abd))
+    return int(abd.lParam)
+
+
+# TranslucentTB 这类工具和本程序改的是同一块任务栏，后写的会覆盖先写的。
+# 检测到就提示用户二选一，而不是让两个程序互相打架。
+_TASKBAR_TOOLS = ("TranslucentTaskbar", "TranslucentTB", "RoundedTB",
+                  "ExplorerPatcher", "TaskbarX", "StartAllBack")
+
+
+def _running_taskbar_tools():
+    """返回正在运行的第三方任务栏工具名（用进程快照，不额外起子进程）。"""
+    found = []
+    try:
+        TH32CS_SNAPPROCESS = 0x2
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", ctypes.c_char * 260)]
+
+        k32 = ctypes.windll.kernel32
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == -1:
+            return found
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        ok = k32.Process32First(snap, ctypes.byref(entry))
+        while ok:
+            name = entry.szExeFile.decode("mbcs", "ignore")
+            stem = os.path.splitext(name)[0]
+            for t in _TASKBAR_TOOLS:
+                if stem.lower() == t.lower() and t not in found:
+                    found.append(t)
+            ok = k32.Process32Next(snap, ctypes.byref(entry))
+        k32.CloseHandle(snap)
+    except Exception:
+        pass
+    return found
+
+
 def _get_exstyle(hwnd):
     _user32.GetWindowLongW.restype = ctypes.c_long
     return _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
@@ -235,13 +320,23 @@ class PanelWin(object):
 
     def info(self):
         hwnds = _taskbars()
-        return {
+        mode = self.taskbar_mode()
+        info = {
             "平台": "Windows",
             "任务栏窗口": "%d 个" % len(hwnds) if hwnds else "未找到",
-            "透明度": "%d%%" % int(self.get_alpha() * 100),
-            "系统透明效果": {True: "开", False: "关", None: "读不到"}[_transparency_enabled()],
-            "已应用": "是" if self._applied else "否",
+            "形态": "自动隐藏" if mode == self.MODE_AUTOHIDE else "整窗淡出",
         }
+        if mode == self.MODE_AUTOHIDE:
+            info["自动隐藏"] = "已开启" if self.get_autohide() else "未生效"
+        else:
+            info["透明度"] = "%d%%" % int(self.get_alpha() * 100)
+        info["系统透明效果"] = {True: "开", False: "关", None: "读不到"}[_transparency_enabled()]
+        info["已应用"] = "是" if self._applied else ("否（自动隐藏不需要）"
+                                                    if mode == self.MODE_AUTOHIDE else "否")
+        tools = _running_taskbar_tools()
+        if tools:
+            info["第三方工具"] = "、".join(tools) + "（会互相覆盖，建议只留一个）"
+        return info
 
     # -- 透明度 -------------------------------------------------------------
     def glass_on(self):
@@ -284,6 +379,65 @@ class PanelWin(object):
         self.apply_glass()      # 透明度必须落到窗口上，因此不看 sync_glass
         return value
 
+    # -- 任务栏形态（Windows 特有的第二条路）--------------------------------
+    MODE_FADE = "fade"
+    MODE_AUTOHIDE = "autohide"
+
+    def taskbar_mode(self):
+        v = str(self.cfg["general"].get("taskbar_mode") or self.MODE_FADE).strip().lower()
+        return self.MODE_AUTOHIDE if v == self.MODE_AUTOHIDE else self.MODE_FADE
+
+    def supports_autohide(self):
+        return bool(IS_WINDOWS and _taskbars())
+
+    def get_autohide(self):
+        state = _appbar(None)
+        return bool(state is not None and (state & ABS_AUTOHIDE))
+
+    def set_autohide(self, on):
+        """开关任务栏自动隐藏。即时生效，写回系统设置本身（重启后保留）。"""
+        if not IS_WINDOWS:
+            return False
+        cur = _appbar(None)
+        base = cur if cur is not None else (ABS_AUTOHIDE | ABS_ALWAYSONTOP)
+        if on:
+            state = base | ABS_AUTOHIDE
+        else:
+            # 关掉时连同 always-on-top 一起复位，回到系统默认的常驻顶栏
+            state = (base & ~ABS_AUTOHIDE) | ABS_ALWAYSONTOP
+        _appbar(state)
+        return self.get_autohide() == bool(on)
+
+    def set_taskbar_mode(self, mode):
+        """两种形态互斥：自动隐藏开着时再把任务栏调半透明会打架，必须先摘干净。"""
+        mode = self.MODE_AUTOHIDE if mode == self.MODE_AUTOHIDE else self.MODE_FADE
+        self.cfg["general"]["taskbar_mode"] = mode
+        if mode == self.MODE_AUTOHIDE:
+            self._drop_opacity()
+            self.set_autohide(True)
+        else:
+            self.set_autohide(False)
+            self.apply_glass()
+        return mode
+
+    def running_taskbar_tools(self):
+        """正在运行的第三方任务栏外观工具。和它们抢同一块任务栏，只能二选一。"""
+        return _running_taskbar_tools() if IS_WINDOWS else []
+
+    def _drop_opacity(self):
+        """摘掉我们自己贴的 layered，不动用户的其他设置。"""
+        for h, ex in list(self._ex_style.items()):
+            _clear_opacity(h, ex)
+        self._ex_style.clear()
+        for h in _taskbars():
+            try:
+                ex = _get_exstyle(h)
+                if ex & WS_EX_LAYERED:
+                    _clear_opacity(h, ex & ~WS_EX_LAYERED)
+            except Exception:
+                pass
+        self._applied = False
+
     # -- 应用 ---------------------------------------------------------------
     BACKUP_KEY = "panel_win"
 
@@ -315,6 +469,12 @@ class PanelWin(object):
         hwnds = _taskbars()
         if not hwnds:
             return False, "找不到任务栏窗口（Shell_TrayWnd）"
+
+        if self.taskbar_mode() == self.MODE_AUTOHIDE:
+            # 自动隐藏模式下不再叠加整窗透明：两者一起用会既看不见任务栏、
+            # 又让悬停出来的那一条发灰。
+            self._drop_opacity()
+            return True, ""
 
         if self.glass_on():
             self._backup_once()
@@ -373,6 +533,16 @@ class PanelWin(object):
         if not IS_WINDOWS:
             return
         hwnds = tuple(_taskbars())
+        if self.taskbar_mode() == self.MODE_AUTOHIDE:
+            # 自动隐藏不靠 layered；只在被系统改动过时补一次（explorer 重启、
+            # 用户在设置里手动关掉），不必每 4 秒重写一次 AppBar 状态。
+            try:
+                if not self.get_autohide():
+                    self.set_autohide(True)
+            except Exception:
+                pass
+            self._last_hwnds = hwnds
+            return
         if hwnds != self._last_hwnds:
             self.apply_glass()
             return
@@ -401,20 +571,14 @@ class PanelWin(object):
         return True
 
     def restore(self):
-        """还原系统外观：任务栏回满不透明、摘掉 layered，再把「透明效果」写回原值。"""
-        for h, ex in list(self._ex_style.items()):
-            _clear_opacity(h, ex)
-        self._ex_style.clear()
+        """还原系统外观：任务栏回满不透明、摘掉 layered，再把「透明效果」写回原值。
+
+        自动隐藏是用户自己选的一项系统设置，这里不动它 —— 退出程序不该把
+        用户设成"碰底边才出来"的用法改回常驻。
+        """
+        self._drop_opacity()
 
         for h in _taskbars():
-            try:
-                # 没记录过的残留（上次异常退出留下的 layered）也一并清掉，
-                # 否则任务栏会一直挂着一个"不透明的分层窗口"状态。
-                ex = _get_exstyle(h)
-                if ex & WS_EX_LAYERED:
-                    _clear_opacity(h, ex & ~WS_EX_LAYERED)
-            except Exception:
-                pass
             try:
                 _set_accent(h, ACCENT_DISABLED, 0)
             except Exception:

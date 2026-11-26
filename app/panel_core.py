@@ -178,6 +178,31 @@ class PanelCore(object):
         # Linux 侧可以一路拖到全透（gsettings 支持 0），没有下限
         return 0.0
 
+    # -- 仅 Windows 有意义的形态接口 -----------------------------------------
+    # 麒麟的 gsettings 透明度本身就是"背景透、图标清晰"，不需要第二形态；
+    # 这里给出中性实现，保证 UI 无条件调用时不会 AttributeError。
+    MODE_FADE = "fade"
+    MODE_AUTOHIDE = "autohide"
+
+    def taskbar_mode(self):
+        return getattr(self, "MODE_FADE", "fade")
+
+    def supports_autohide(self):
+        return False
+
+    def get_autohide(self):
+        return False
+
+    def set_autohide(self, on):
+        return False
+
+    def set_taskbar_mode(self, mode):
+        self.cfg["general"]["taskbar_mode"] = mode
+        return mode
+
+    def running_taskbar_tools(self):
+        return []
+
     def get_alpha(self):
         raw = _unquote(_gget(SCHEMA_P, KEY_TRANS))
         try:
