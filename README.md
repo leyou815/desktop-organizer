@@ -116,22 +116,23 @@
 
 ### 5. 截图与贴图
 
-快捷键照 Snipaste 那套：
+快捷键：
 
 | 键 | 干什么 |
 |---|---|
 | `F1` | 截屏（进标注界面） |
-| `F2` | 截屏并自动复制（框完直接进剪贴板，不进标注） |
 | `Shift+F1` | 自定义截屏（先定尺寸，再拖着框定位） |
-| `F3` | 把剪贴板里的图贴到屏幕上 |
-| `Shift+F3` | 隐藏 / 显示所有贴图 |
+| `F3` | 贴图：没有贴图时把剪贴板里的图贴到屏幕上；有贴图时在隐藏 / 显示之间来回切 |
+
+> F2（截屏并复制）已删：标注完点对号本身就复制到剪贴板，单独一个热键没有意义。
+> 贴图窗口上按 `ESC` 可关掉单张。
 
 ![截图](assets/snip-overlay.png)
 
 - **八种标注**：方框、圆形（`Shift` 出正方 / 正圆）、箭头、折线、画笔、记号笔（荧光笔）、马赛克、文字；`Ctrl+Z` 撤销、`Ctrl+Y` 重做
 - **像素级对齐**：拖选时鼠标旁边有 4 倍放大镜 + 坐标，框定后用方向键微调 1px（`Shift` 10px）
 - **贴图**：钉在屏幕上当参考图，**落在原截图的位置**，鼠标拖边角缩放（拖角锁比例）、滚轮缩放、`Ctrl+滚轮`调透明度
-- **一键让路**：设置里可以整体关掉这组快捷键，把 F1/F2/F3 还给别的程序
+- **一键让路**：设置里可以整体关掉这组快捷键，把 F1/F3 还给别的程序
 
 ![贴图](assets/snip-pin.png)
 
@@ -336,10 +337,10 @@ Office、微信、QQ、百度网盘、火绒这些「所有用户」安装的软
 
 | 入口 | 怎么用 |
 |---|---|
-| **快捷键** | `F1` 截图 / `F2` 截图并复制 / `Shift+F1` 固定尺寸 |
-| **托盘右键** | 前四项：截图 / 截图并复制 / 自定义截屏 / 贴图 |
+| **快捷键** | `F1` 截图 / `Shift+F1` 固定尺寸 / `F3` 贴图 |
+| **托盘右键** | 截图 / 自定义截屏 / 贴图 / 隐藏显示所有贴图 |
 | **主窗口** | 导航「截图」页 → 「开始截图」 |
-| **命令行** | `zhengli snip`（主程序没在跑也能用）/ `zhengli snipcopy` |
+| **命令行** | `zhengli snip`（主程序没在跑也能用）/ `zhengli pin` |
 
 截图开始时会**自动收起主窗口**，免得把自己截进去；按 `ESC` 取消会把窗口还回来。
 
@@ -413,7 +414,7 @@ Office、微信、QQ、百度网盘、火绒这些「所有用户」安装的软
 
 ### 快捷键总开关
 
-F1 / F2 / F3 是全局抓的，会盖住别的程序：**浏览器的 F1 是帮助、F3 是查找下一个**。
+F1 / F3 是全局抓的，会盖住别的程序：**浏览器的 F1 是帮助、F3 是查找下一个**。
 所以给了个开关，位置有三处：
 
 - 主窗口「截图」页 →「启用截图快捷键」
@@ -422,10 +423,10 @@ F1 / F2 / F3 是全局抓的，会盖住别的程序：**浏览器的 F1 是帮�
 
 关掉之后：
 
-- 这四个键**完全不再抓取**（应用根本收不到它们，等于还给了系统）
+- 这几个键**完全不再抓取**（应用根本收不到它们，等于还给了系统）
 - 热键注册会重建一次，`Ctrl+Alt+G`（任务栏材质）不受影响
 - 截图功能本身还在——托盘菜单和主窗口按钮照样能用
-- 设置页那行提示会变成「截图快捷键已关闭，F1 / F2 / F3 归还给其它程序」
+- 设置页那行提示会变成「截图快捷键已关闭，F1 / F3 归还给其它程序」
 
 > 为什么不做成"只放掉冲突的那一个"：X 的 key grab 是整键粒度，没法只让某个应用例外。
 > 要么全抓、要么全放，开关做在这个粒度上才对得上实际行为。
@@ -449,9 +450,8 @@ zhengli tidy            # 一键整理
 zhengli scan            # 预览会怎么归，不移动
 zhengli undo            # 撤销上一次操作（整理或批量改动）
 zhengli snip            # 截图（主程序没在跑也能用）
-zhengli snipcopy        # 截图并直接复制
-zhengli pin             # 把剪贴板里的图钉到屏幕上
-zhengli snipkeys off    # 关掉截图快捷键，把 F1/F2/F3 还给别的程序
+zhengli pin             # 贴图：没有贴图时贴剪贴板，有贴图时显示/隐藏切换
+zhengli snipkeys off    # 关掉截图快捷键，把 F1/F3 还给别的程序
 zhengli stat            # 两个模块的状态一起看
 zhengli panel 55        # 任务栏透明度 55%
 zhengli glass on|off    # 玻璃质感开关
@@ -531,10 +531,10 @@ Win10（build < 22000）保留 accent 分支，那边 alpha 真的有效，只�
 | 键盘 | 方向键 1px、`Shift`+方向键 10px，选区与内部坐标同步 |
 | 输出 | `Enter` 复制（尺寸与选区一致）、`Ctrl+S` 存盘、`F3` 贴图、`ESC` 取消 |
 | 贴图 | 拖动/缩放（420×260 → 630×390）/透明度 0.6，关闭后从列表移除 |
-| 六热键 | `F1` / `F2` / `Shift+F1` / `F3` / `Shift+F3` / `Ctrl+Alt+G` 六个键各自独立触发，互不串 |
+| 五热键 | `F1` / `Shift+F1` / `F3` / `Ctrl+Alt+G` 各自独立触发，互不串 |
 | 快捷键开关 | 关掉后只剩 `Ctrl+Alt+G` 被占用，按 F1 不再弹截图；再打开立刻恢复 |
-| 截屏并复制 | `F2` 框完直接进剪贴板（561×441），不进标注界面 |
 | 固定尺寸 | `Shift+F1` 定 400×300，选区恒为 400×300，跟着鼠标定位 |
+| 贴图切换 | `F3` 无贴图时贴剪贴板；有贴图时隐藏 → 再按显示，如此循环；单张贴图 `ESC` 关闭 |
 | 折线 / 记号笔 | 折线 3 个折点正确落图；记号笔存成 `marker` 类型、半透明粗线 |
 | 撤销重做 | 画 2 笔 → undo 剩 1 → redo 回到 2，重做链在画新笔时清空 |
 
@@ -665,7 +665,7 @@ A small tray utility for **Kylin V10 (UKUI)** and **Windows 10/11** that does th
 2. **One-click desktop cleanup** — files stay on the desktop until you press the button,
    then get sorted into a hidden `.桌面抽屉` folder by type. Every move is logged and reversible.
 
-3. **Screenshot & pin** — `F1` to drag-select (F2 = copy directly), annotate with rectangle /
+3. **Screenshot & pin** — `F1` to drag-select (the check button copies when done), annotate with rectangle /
    circle / arrow / polyline / pen / marker / mosaic / text, then copy, save, or pin the shot on
    screen as a floating reference (scroll to scale, Ctrl+scroll for opacity).
 

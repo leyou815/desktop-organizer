@@ -522,22 +522,19 @@ class PanelWin(object):
         """正在运行的第三方任务栏外观工具。和它们抢同一块任务栏，只能二选一。"""
         return _running_taskbar_tools() if IS_WINDOWS else []
 
-    # -- 外观档位（给界面用的固定值，取代原来的滑块）------------------------
-    # 每个档位背后其实是「形态 + 浓度」两件事，打包成一个 key，
-    # 界面只认 key，切换逻辑集中在这里，以后加档位不用动 UI。
-    #   None 表示这一档不靠浓度实现，而是走 inject / autohide 形态。
+    # -- 外观档位（给界面用的固定值）----------------------------------------
+    # 横排单选按钮用的六档，两端是「无痕」（整块消失）和「凝实」（系统原样），
+    # 中间四档取 0.15 / 0.35 / 0.60 / 0.80 的等视感梯度（按实测亮度曲线挑的，
+    # 档与档之间肉眼能分清，又不至于密到点错）。
     #   半透明档 = 注入后把背景那块矩形的 Opacity 压低，图标不在里面，
     #   所以「背景变淡、图标照旧清晰」——整窗 alpha 做不到这一点（55% 以下图标就糊了）。
     STYLES = (
-        ("default",  "系统默认",          1.00),
-        ("clear",    "完全透明",          None),
-        ("tint10",   "半透明 · 10%",      0.10),
-        ("tint20",   "半透明 · 20%",      0.20),
-        ("tint40",   "半透明 · 40%",      0.40),
-        ("tint55",   "半透明 · 55%",      0.55),
-        ("tint72",   "半透明 · 72%",      0.72),
-        ("tint85",   "半透明 · 85%",      0.85),
-        ("autohide", "自动隐藏",          None),
+        ("clear", "无痕", 0.00),
+        ("gauze", "轻纱", 0.15),
+        ("mist",  "薄雾", 0.35),
+        ("frost", "磨砂", 0.60),
+        ("haze",  "浓雾", 0.80),
+        ("solid", "凝实", 1.00),
     )
 
     def current_style(self):
@@ -547,20 +544,18 @@ class PanelWin(object):
         多存一份等于给"配置和现实不一致"留了个后门。
         """
         mode = self.taskbar_mode()
-        if mode == self.MODE_AUTOHIDE:
-            return "autohide"
         if mode == self.MODE_INJECT:
             a = self.inject_tint()
-            if a <= 0.001:
-                return "clear"
-        else:
+        elif mode == self.MODE_FADE:
             a = self.get_alpha()
+        else:
+            # 自动隐藏等非档位形态：界面上按最实的一档显示
+            a = 1.0
         for key, _label, val in self.STYLES:
-            if val is not None and abs(val - a) < 0.04:
+            if abs(val - a) < 0.08:
                 return key
-        # 老配置里可能是任意值（比如 0.6），挑最接近的档位显示，不假装精确
-        best = min((s for s in self.STYLES if s[2] is not None),
-                   key=lambda s: abs(s[2] - a))
+        # 老配置里可能是任意值（比如 0.55、0.72），挑最接近的档位显示，不假装精确
+        best = min(self.STYLES, key=lambda s: abs(s[2] - a))
         return best[0]
 
     def inject_tint(self):
@@ -573,15 +568,11 @@ class PanelWin(object):
     def set_style(self, key):
         """按档位切换。切哪个都先把另外两种形态摘干净，避免叠在一起互相糊。"""
         if not any(k == key for k, _l, _v in self.STYLES):
-            key = "default"
-        if key == "clear":
-            return self.set_taskbar_mode(self.MODE_INJECT, 0.0)
-        if key == "autohide":
-            return self.set_taskbar_mode(self.MODE_AUTOHIDE)
+            key = "solid"
 
-        alpha = dict((k, v) for k, _l, v in self.STYLES)[key]
-        if alpha >= 0.999:
-            # 「系统默认」既不留在注入形态（那会让组件一直被钉在 explorer 里），
+        tint = dict((k, v) for k, _l, v in self.STYLES)[key]
+        if tint >= 0.999:
+            # 「不透明」既不留在注入形态（那会让组件一直被钉在 explorer 里），
             # 也不留一个 255 的 layered 标志（视觉一样，但 restore 时多一层要还）。
             if self.taskbar_mode() != self.MODE_FADE:
                 self.set_taskbar_mode(self.MODE_FADE)
@@ -591,11 +582,11 @@ class PanelWin(object):
 
         if self.supports_inject():
             # 注入能给"背景淡、图标清晰"，优先走它
-            return self.set_taskbar_mode(self.MODE_INJECT, alpha)
+            return self.set_taskbar_mode(self.MODE_INJECT, tint)
 
         # 没有注入组件（安装包缺文件 / 杀软删了）时的兜底：整窗淡出。
         # 最低只能到 0.55——再低图标和文字一起糊成一片，还不如不给这档。
-        alpha = max(0.55, alpha)
+        alpha = max(0.55, tint)
         if self.taskbar_mode() != self.MODE_FADE:
             self.set_taskbar_mode(self.MODE_FADE)
         self.set_alpha(alpha)

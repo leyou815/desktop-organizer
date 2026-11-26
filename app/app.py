@@ -147,20 +147,15 @@ class App(QObject):
         a.triggered.connect(lambda: self.start_snip())
         menu.addAction(a)
 
-        a = QAction("截图并复制    %s" % self.snip_copy_hotkey_pretty(), self)
-        a.triggered.connect(lambda: self.start_snip(auto_copy=True))
-        menu.addAction(a)
-
         a = QAction("自定义截屏    %s" % self.snip_fixed_hotkey_pretty(), self)
         a.triggered.connect(lambda: self.start_snip(fixed=True))
         menu.addAction(a)
 
         a = QAction("贴图        %s" % self.pin_hotkey_pretty(), self)
-        a.triggered.connect(self.pin_clipboard)
+        a.triggered.connect(self.pin_or_toggle)
         menu.addAction(a)
 
-        self.act_pin_toggle = QAction("隐藏/显示所有贴图    %s"
-                                      % self.pin_toggle_hotkey_pretty(), self)
+        self.act_pin_toggle = QAction("隐藏/显示所有贴图", self)
         self.act_pin_toggle.triggered.connect(self.toggle_pins_visible)
         menu.addAction(self.act_pin_toggle)
 
@@ -168,7 +163,7 @@ class App(QObject):
         self.act_snip_hotkeys = QAction("启用截图快捷键", self)
         self.act_snip_hotkeys.setCheckable(True)
         self.act_snip_hotkeys.setChecked(on)
-        self.act_snip_hotkeys.setToolTip("关掉后 F1/F2/F3 归还给其它程序")
+        self.act_snip_hotkeys.setToolTip("关掉后 F1/F3 归还给其它程序")
         self.act_snip_hotkeys.triggered.connect(self.set_snip_hotkeys)
         menu.addAction(self.act_snip_hotkeys)
 
@@ -258,10 +253,8 @@ class App(QObject):
 
         if self.flag("snip_hotkeys_on"):
             hks.add("snip", g.get("snip_hotkey", "F1"))
-            hks.add("snip_copy", g.get("snip_copy_hotkey", "F2"))
             hks.add("snip_fixed", g.get("snip_fixed_hotkey", "<Shift>F1"))
             hks.add("pin", g.get("pin_hotkey", "F3"))
-            hks.add("pin_toggle", g.get("pin_toggle_hotkey", "<Shift>F3"))
 
         hks.triggered.connect(self._on_hotkey)
         if hks.start():
@@ -281,15 +274,15 @@ class App(QObject):
         self.hotkeys = self._build_hotkeys()
 
     def set_snip_hotkeys(self, on):
-        """截图快捷键总开关：关掉 → F1/F2/F3 还给其它程序。"""
+        """截图快捷键总开关：关掉 → F1/F3 还给其它程序。"""
         appcfg.set_flag(self.cfg, "snip_hotkeys_on", on)
         self.save_cfg()
         self.reboot_hotkeys()
         if self.tray:
             self.tray.showMessage(
                 APP_NAME,
-                "截图快捷键已开启（F1 / F2 / Shift+F1 / F3 / Shift+F3）" if on
-                else "截图快捷键已关闭，F1/F2/F3 归还给其它程序",
+                "截图快捷键已开启（F1 / Shift+F1 / F3）" if on
+                else "截图快捷键已关闭，F1/F3 归还给其它程序",
                 QSystemTrayIcon.Information, 2600)
         self.win.refresh()
 
@@ -301,14 +294,10 @@ class App(QObject):
             self._cycle_material()
         elif label == "snip":
             self.start_snip()
-        elif label == "snip_copy":
-            self.start_snip(auto_copy=True)
         elif label == "snip_fixed":
             self.start_snip(fixed=True)
         elif label == "pin":
-            self.pin_clipboard()
-        elif label == "pin_toggle":
-            self.toggle_pins_visible()
+            self.pin_or_toggle()
 
     def hotkey_errors(self):
         return getattr(self, "hk_errors", {}) or {}
@@ -320,17 +309,11 @@ class App(QObject):
     def snip_hotkey_pretty(self):
         return pretty_combo(self.cfg["general"].get("snip_hotkey", "F1"))
 
-    def snip_copy_hotkey_pretty(self):
-        return pretty_combo(self.cfg["general"].get("snip_copy_hotkey", "F2"))
-
     def snip_fixed_hotkey_pretty(self):
         return pretty_combo(self.cfg["general"].get("snip_fixed_hotkey", "<Shift>F1"))
 
     def pin_hotkey_pretty(self):
         return pretty_combo(self.cfg["general"].get("pin_hotkey", "F3"))
-
-    def pin_toggle_hotkey_pretty(self):
-        return pretty_combo(self.cfg["general"].get("pin_toggle_hotkey", "<Shift>F3"))
 
     def _cycle_material(self):
         vals = [v for _, _, v in PRESETS]
@@ -354,7 +337,8 @@ class App(QObject):
     def start_snip(self, auto_copy=False, fixed=False):
         """抓屏 → 弹框选遮罩。
 
-        auto_copy=True  （F2）框完直接复制走，不进标注界面
+        auto_copy=True  框完直接复制走，不进标注界面（原 F2 路径，热键已删，
+                        现在完成键（对号）本身就会复制；该参数仅留给内部调用）
         fixed=True      （Shift+F1）先问一个固定尺寸，拖着框定位
         """
         if self._overlay is not None:
@@ -464,6 +448,17 @@ class App(QObject):
             return
         self._add_pin(pm)
 
+    def pin_or_toggle(self):
+        """F3 贴图键：没有贴图时把剪贴板图片贴出来；有贴图就显示/隐藏来回切。
+
+        这样一个键走完「贴出来 → 暂时藏掉 → 再放出来」整个循环；
+        想彻底关掉某张贴图，在贴图上按 ESC。
+        """
+        if self.pins:
+            self.toggle_pins_visible()
+            return
+        self.pin_clipboard()
+
     def _add_pin(self, pixmap, pos=None):
         """pos 给了就贴在那儿（截图原位），没给就居中并逐张错开。"""
         if pos is None:
@@ -483,7 +478,7 @@ class App(QObject):
         pin.raise_()
 
     def toggle_pins_visible(self):
-        """Shift+F3：把所有贴图临时藏起来／放出来。"""
+        """F3（有贴图时）：把所有贴图临时藏起来／放出来。"""
         if not self.pins:
             self._toast("现在没有贴图")
             return
@@ -844,8 +839,6 @@ def run(argv=None):
             ctl.open_drawer()
         elif cmd == "snip":
             ctl.start_snip()
-        elif cmd == "snip-copy":
-            ctl.start_snip(auto_copy=True)
         elif cmd == "snip-fixed":
             ctl.start_snip(fixed=True)
         elif cmd == "pin-toggle":
@@ -853,7 +846,7 @@ def run(argv=None):
         elif cmd == "reboot-hotkeys":
             ctl.reboot_hotkeys()
         elif cmd == "pin":
-            ctl.pin_clipboard()
+            ctl.pin_or_toggle()
         elif cmd == "win":
             ctl.show_window()
         elif cmd == "quit":

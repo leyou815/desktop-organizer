@@ -21,7 +21,7 @@ from PyQt5.QtGui import (QColor, QPainter, QLinearGradient, QPainterPath, QPen,
 from PyQt5.QtWidgets import (QWidget, QLabel, QPushButton, QSlider, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QFrame, QStackedWidget,
                              QAbstractButton, QSizePolicy, QFileDialog, QApplication,
-                             QComboBox)
+                             QButtonGroup)
 
 import launchers
 import rules
@@ -57,47 +57,53 @@ def app_icon(pal, size=64):
 # --------------------------------------------------------------------------- #
 # 基础控件
 # --------------------------------------------------------------------------- #
-class StyleCombo(QComboBox):
-    """档位下拉：保留原生弹层，只自己画右边那个三角。
+class StyleChips(QWidget):
+    """透明度档位：横排单选胶囊按钮。点谁选谁、立刻生效，没有多余文字。
 
-    QSS 里用 border 拼三角在 Qt 上不生效（实测画出来是个小方块），
-    给 ::down-arrow 指定图片又得带一份资源文件，所以直接画两笔。
+    用 QButtonGroup(exclusive) 保证单选；选中态整颗填充主题色，
+    未选中是描边胶囊，悬停只换描边色。
     """
 
-    def __init__(self, pal, parent=None):
-        super(StyleCombo, self).__init__(parent)
+    stylePicked = pyqtSignal(str)
+
+    def __init__(self, pal, options, parent=None):
+        super(StyleChips, self).__init__(parent)
         self.pal = pal
-        self.setStyleSheet(self._qss())
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self.buttons = {}
+        qss = self._qss()
+        for key, label in options:
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(30)
+            b.setMinimumWidth(58)
+            b.setStyleSheet(qss)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(lambda _=False, k=key: self.stylePicked.emit(k))
+            self._group.addButton(b)
+            lay.addWidget(b, 1)          # 等宽撑满一行，视觉上是一根档位条
+            self.buttons[key] = b
 
     def _qss(self):
         pal = self.pal
-        return """
-        QComboBox{border:1px solid %s;border-radius:8px;background:%s;
-            color:%s;font-size:12px;padding:0 28px 0 12px;}
-        QComboBox:hover{border:1px solid %s;}
-        QComboBox::drop-down{border:none;width:22px;background:transparent;}
-        QComboBox QAbstractItemView{border:1px solid %s;border-radius:8px;
-            background:%s;color:%s;selection-background-color:%s;
-            selection-color:#FFFFFF;outline:none;padding:4px;}
-        QComboBox QAbstractItemView::item{height:26px;padding-left:8px;}
-        """ % (pal.line.name(), pal.card.name(), pal.text.name(), pal.accent.name(),
-               pal.line.name(), pal.card.name(), pal.text.name(), pal.accent.name())
+        return ("QPushButton{border:1px solid %s;border-radius:15px;background:%s;"
+                "color:%s;font-size:12px;padding:0 8px;}"
+                "QPushButton:hover{border:1px solid %s;color:%s;}"
+                "QPushButton:checked{background:%s;border:1px solid %s;"
+                "color:#FFFFFF;font-weight:600;}"
+                % (pal.line.name(), pal.card.name(), pal.text.name(),
+                   pal.accent.name(), pal.accent.name(),
+                   pal.accent.name(), pal.accent.name()))
 
-    def paintEvent(self, e):
-        super(StyleCombo, self).paintEvent(e)
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        cx = self.width() - 16.0
-        cy = self.height() / 2.0
-        path = QPainterPath()
-        path.moveTo(cx - 4.0, cy - 2.0)
-        path.lineTo(cx + 4.0, cy - 2.0)
-        path.lineTo(cx, cy + 3.0)
-        path.closeSubpath()
-        p.setPen(Qt.NoPen)
-        p.setBrush(self.pal.muted)
-        p.drawPath(path)
-        p.end()
+    def set_current(self, key):
+        """按 key 选中。setChecked 不触发 clicked，回同步不会反过来改档位。"""
+        for k, b in self.buttons.items():
+            b.setChecked(k == key)
 
 
 class Switch(QAbstractButton):
@@ -436,7 +442,7 @@ class MainWindow(QWidget):
         head = QHBoxLayout()
         box = QVBoxLayout()
         box.setSpacing(1)
-        t = QLabel("任务栏外观" if sysenv.IS_WINDOWS else "任务栏透明度")
+        t = QLabel("任务栏透明度")
         t.setFont(pal.font_ui(17, bold=True))
         t.setStyleSheet("color:%s;" % pal.text.name())
         # 文案按平台分开写：Win11 的任务栏背景是 explorer 内部的 XAML 表面，
@@ -445,8 +451,9 @@ class MainWindow(QWidget):
             sub_text = "只影响任务栏，退出程序自动还原"
         else:
             sub_text = "拉低就透出壁纸，磨砂质感始终保留"
+        # 副标题一律单行：这行字折成两段会把标题区撑得很难看
         sub = QLabel(sub_text)
-        sub.setWordWrap(True)
+        sub.setWordWrap(False)
         sub.setFont(pal.font_mono(10))
         sub.setStyleSheet("color:%s;" % pal.muted.name())
         box.addWidget(t)
@@ -464,48 +471,14 @@ class MainWindow(QWidget):
         lay.addLayout(head)
 
         # ---------------------------------------------------------------- #
-        # Windows：一个下拉选档位。原来那套「滑块 + 百分比 + 两个开关」
-        # 把同一件事拆成了四处，用户得先理解三种形态互斥才敢动手；
-        # 改成档位后所见即所得，也不会出现"滑块在中间到底是哪种形态"。
-        # 控件仍然创建（下面的方法会引用），只是不加进布局。
+        # Windows：横排单选档位条。六档胶囊点谁选谁，立刻生效；
+        # 页面不放说明文字，档位名本身就能看懂（无痕/轻纱/薄雾/磨砂/浓雾/凝实）。
         # ---------------------------------------------------------------- #
         if sysenv.IS_WINDOWS:
-            self.style_row = QWidget()
-            self.style_row.setStyleSheet("background:transparent;")
-            sr = QHBoxLayout(self.style_row)
-            sr.setContentsMargins(0, 4, 0, 0)
-            sr.setSpacing(12)
-            st = QVBoxLayout()
-            st.setSpacing(1)
-            s_lab = QLabel("任务栏样式")
-            s_lab.setStyleSheet("color:%s;font-size:13px;font-weight:600;"
-                                % pal.text.name())
-            st.addWidget(s_lab)
-            sr.addLayout(st, 1)
-
-            self.style_combo = StyleCombo(pal)
-            self.style_combo.setCursor(Qt.PointingHandCursor)
-            self.style_combo.setFixedWidth(184)
-            self.style_combo.setFixedHeight(32)
-            for key, label, _v in self.app.panel.STYLES:
-                self.style_combo.addItem(label, key)
-            self.style_combo.currentIndexChanged.connect(self._on_style)
-            sr.addWidget(self.style_combo, 0, Qt.AlignVCenter)
-            lay.addWidget(self.style_row)
-
-            self.style_note = QLabel("")
-            self.style_note.setWordWrap(True)
-            self.style_note.setStyleSheet("color:%s;font-size:10.5px;" % pal.muted.name())
-            self.style_note.setVisible(False)
-            lay.addWidget(self.style_note)
-
-            # 这一页只有一个下拉会显得空，把「各档实际差别」摆出来，省得一个个试。
-            # 常显而不是按档位显隐：用户选之前就想知道差别，选完才告诉他就晚了。
-            self.style_help = self._hint_card(
-                "完全透明：背景整块去掉，图标保持原样，效果最干净。\n"
-                "半透明：数字是背景的浓度，越小越透；只压背景，图标和文字始终清晰。\n"
-                "自动隐藏：整条让位给壁纸，鼠标碰屏幕底边才滑出来，图标零损失。")
-            lay.addWidget(self.style_help)
+            self.style_chips = StyleChips(
+                pal, [(k, l) for k, l, _v in self.app.panel.STYLES])
+            self.style_chips.stylePicked.connect(self._on_style)
+            lay.addWidget(self.style_chips)
 
         # 注入全透明（Windows 独有，v1.0.6+）：真把任务栏背景摘掉，图标不受影响
         self.inject_row = QWidget(page)
@@ -872,7 +845,7 @@ class MainWindow(QWidget):
 
         self.sw_snipkeys = self._setting_row(
             lay, "启用截图快捷键",
-            "关掉后 F1 / F2 / F3 归还给其它程序（浏览器帮助、查找下一个等）")
+            "关掉后 F1 / F3 归还给其它程序（浏览器帮助、查找下一个等）")
         self.sw_snipkeys.toggled.connect(self._on_snip_keys)
 
         self.sw_snipcopy = self._setting_row(
@@ -1059,10 +1032,6 @@ class MainWindow(QWidget):
         """ % (pal.line.name(), pal.muted.name(), pal.card_hi.name(),
                pal.accent.name(), pal.accent.name(), pal.card_hi.name())
 
-    def _combo_qss(self):
-        """档位下拉的样式在 StyleCombo 内部维护，这里只为兼容旧调用点。"""
-        return StyleCombo(self.pal)._qss()
-
     # -- 背景 ---------------------------------------------------------------
     def paintEvent(self, e):
         p = QPainter(self)
@@ -1118,16 +1087,16 @@ class MainWindow(QWidget):
             on = self.app.snip_hotkeys_on()
             self.sw_snipkeys.set_silent(on)
             if on:
-                tip = "截图 %s · 截图并复制 %s · 固定尺寸 %s · 贴图 %s · 隐藏贴图 %s" % (
-                    self.app.snip_hotkey_pretty(), self.app.snip_copy_hotkey_pretty(),
-                    self.app.snip_fixed_hotkey_pretty(), self.app.pin_hotkey_pretty(),
-                    self.app.pin_toggle_hotkey_pretty())
-                bad = [k for k in ("snip", "snip_copy", "snip_fixed", "pin", "pin_toggle")
+                tip = "截图 %s · 固定尺寸 %s · 贴图 %s" % (
+                    self.app.snip_hotkey_pretty(),
+                    self.app.snip_fixed_hotkey_pretty(),
+                    self.app.pin_hotkey_pretty())
+                bad = [k for k in ("snip", "snip_fixed", "pin")
                        if k in errs]
                 if bad:
                     tip += "   ⚠ 有 %d 个键没注册上" % len(bad)
             else:
-                tip = "截图快捷键已关闭，F1 / F2 / F3 归还给其它程序"
+                tip = "截图快捷键已关闭，F1 / F3 归还给其它程序"
             self.snip_hk_lb.setText(tip)
             self.sw_snipcopy.set_silent(self.app.flag("snip_copy"))
             self.sw_snipsave.set_silent(self.app.flag("snip_save"))
@@ -1279,26 +1248,20 @@ class MainWindow(QWidget):
             self.panel_status.setText("设置失败：%s" % e)
             self._apply_mode_ui()          # 以真实状态回同步，别让开关停在"开"
 
-    def _on_style(self, _idx=None):
-        """下拉切档位。失败（注入被拦、组件被删）就把下拉拨回真实档位，不留假选项。"""
+    def _on_style(self, key=None):
+        """点档位胶囊切档。失败（注入被拦、组件被删）就把选中态拨回真实档位，
+        不留假选中。"""
+        if not key:
+            return
         try:
-            key = self.style_combo.currentData()
             label = dict((k, l) for k, l, _v in self.app.panel.STYLES).get(key, key)
-            if key == "clear":
-                self.panel_status.setText("正在把透明组件送进资源管理器……")
+            if key != "solid":
+                self.panel_status.setText("正在应用「%s」……" % label)
                 QApplication.processEvents()    # 注入要等对方回应，先让这句话上屏
             self.app.panel.set_style(key)
             self.app.save_cfg()
             self._apply_mode_ui()
-            if key == "clear":
-                msg = "任务栏已完全透明：背景交给壁纸，图标不受影响"
-            elif key == "autohide":
-                msg = "任务栏已设为自动隐藏：鼠标碰到屏幕底边才滑出来"
-            elif key == "default":
-                msg = "任务栏已回到系统默认外观"
-            else:
-                msg = "任务栏样式已设为「%s」" % label
-            self.panel_status.setText(msg)
+            self.panel_status.setText("任务栏外观已设为「%s」" % label)
         except Exception as e:
             self.panel_status.setText("设置失败：%s" % e)
             self._apply_mode_ui()
@@ -1315,26 +1278,14 @@ class MainWindow(QWidget):
             mode = "fade"
         inj = mode == getattr(self.app.panel, "MODE_INJECT", "inject")
 
-        # Windows：下拉 + 一行说明。档位由后端 current_style() 推导，
-        # 不信界面自己的记忆——注入失败时后端会把配置退回，界面必须跟着退。
-        if hasattr(self, "style_combo"):
+        # Windows：档位条。档位由后端 current_style() 推导，不信界面自己的
+        # 记忆——注入失败时后端会把配置退回，选中态必须跟着退。
+        if hasattr(self, "style_chips"):
             try:
                 key = self.app.panel.current_style()
             except Exception:
-                key = "default"
-            idx = self.style_combo.findData(key)
-            if idx >= 0 and idx != self.style_combo.currentIndex():
-                self.style_combo.blockSignals(True)
-                self.style_combo.setCurrentIndex(idx)
-                self.style_combo.blockSignals(False)
-            if hasattr(self, "style_note"):
-                notes = {
-                    "clear": "已生效：任务栏背景交给壁纸，图标原样。资源管理器重启后会自动重连；"
-                             "想彻底卸掉这份组件，重启一次资源管理器即可。",
-                    "autohide": "已生效：任务栏收进屏幕边缘，鼠标碰到最底下一行才滑出来。",
-                }
-                self.style_note.setText(notes.get(key, ""))
-                self.style_note.setVisible(key in notes)
+                key = "solid"
+            self.style_chips.set_current(key)
 
         if hasattr(self, "sw_autohide"):
             self.sw_autohide.set_silent(auto)

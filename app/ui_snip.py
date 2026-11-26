@@ -138,6 +138,11 @@ def draw_glyph(p, kind, r, color):
         p.drawRect(QRectF(x + w * 0.16, y + h * 0.16, w * 0.44, h * 0.44))
         p.drawRect(QRectF(x + w * 0.38, y + h * 0.38, w * 0.44, h * 0.44))
 
+    elif kind == "ok":
+        # 完成对号：笔画比其它图标粗一点，末尾按钮要有分量
+        p.setPen(QPen(color, 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.drawPolyline(QPolygonF([pt(0.22, 0.54), pt(0.44, 0.74), pt(0.80, 0.26)]))
+
     elif kind == "close":
         p.drawLine(pt(0.28, 0.28), pt(0.72, 0.72))
         p.drawLine(pt(0.72, 0.28), pt(0.28, 0.72))
@@ -148,7 +153,7 @@ def draw_glyph(p, kind, r, color):
 class ToolButton(QAbstractButton):
     """工具条上的方按钮：自己画图标，选中/悬停有自己的底色。"""
 
-    def __init__(self, glyph, tip, pal, checkable=False, size=28, text=None):
+    def __init__(self, glyph, tip, pal, checkable=False, size=32, text=None):
         super(ToolButton, self).__init__()
         self.glyph = glyph
         self.text = text
@@ -156,7 +161,7 @@ class ToolButton(QAbstractButton):
         self.setToolTip(tip)
         self.setCursor(Qt.PointingHandCursor)
         self.setCheckable(checkable)
-        self.setFixedSize(size, 26)
+        self.setFixedSize(size, 27)
         self.setFocusPolicy(Qt.NoFocus)
         self._hover = False
 
@@ -194,7 +199,7 @@ class ToolButton(QAbstractButton):
             p.setPen(QPen(fg))
             p.drawText(self.rect(), Qt.AlignCenter, self.text)
         else:
-            side = min(self.width(), self.height()) - 6
+            side = min(self.width(), self.height()) - 5
             box = QRect(0, 0, side, side)
             box.moveCenter(self.rect().center())
             draw_glyph(p, self.glyph, QRectF(box), fg)
@@ -270,10 +275,10 @@ class SnipBar(QWidget):
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(1)
 
-        # 工具
+        # 工具。悬停提示只给最短的名字，操作方式（快捷键等）不往里塞。
         self.tools = {}
         for key, name, _ in snip.TOOLS:
-            b = ToolButton(key, "%s（再点一次取消）" % name, pal, checkable=True)
+            b = ToolButton(key, name, pal, checkable=True)
             b.clicked.connect(lambda _=False, k=key: self._tool(k))
             lay.addWidget(b)
             self.tools[key] = b
@@ -307,11 +312,11 @@ class SnipBar(QWidget):
 
         # 撤销 / 重做
         lay.addSpacing(4)
-        self.btn_undo = ToolButton("undo", "撤销上一个标注  Ctrl+Z", pal)
+        self.btn_undo = ToolButton("undo", "撤销", pal)
         self.btn_undo.clicked.connect(lambda: self.acted.emit("undo"))
         lay.addWidget(self.btn_undo)
 
-        self.btn_redo = ToolButton("redo", "重做  Ctrl+Y", pal)
+        self.btn_redo = ToolButton("redo", "重做", pal)
         self.btn_redo.clicked.connect(lambda: self.acted.emit("redo"))
         lay.addWidget(self.btn_redo)
 
@@ -320,22 +325,21 @@ class SnipBar(QWidget):
 
         # 输出
         lay.addSpacing(4)
-        self.btn_pin = ToolButton("pin", "贴到屏幕上  F3", pal)
+        self.btn_pin = ToolButton("pin", "置顶", pal)
         self.btn_pin.clicked.connect(lambda: self.acted.emit("pin"))
         lay.addWidget(self.btn_pin)
 
-        self.btn_save = ToolButton("save", "保存到截图文件夹  Ctrl+S", pal)
+        self.btn_save = ToolButton("save", "保存", pal)
         self.btn_save.clicked.connect(lambda: self.acted.emit("save"))
         lay.addWidget(self.btn_save)
 
-        self.btn_copy = ToolButton("copy", "复制到剪贴板  Enter", pal)
-        self.btn_copy.clicked.connect(lambda: self.acted.emit("copy"))
-        lay.addWidget(self.btn_copy)
-
+        # 复制和关闭不做成按钮：复制交给末尾的对号（完成即复制），
+        # 关闭走 ESC。工具条更短，动作也更明确。
         lay.addWidget(self._sep())
-        b = ToolButton("close", "取消  ESC", pal)
-        b.clicked.connect(lambda: self.acted.emit("close"))
-        lay.addWidget(b)
+        self.btn_ok = ToolButton("ok", "完成", pal)
+        self.btn_ok.setFixedSize(34, 27)
+        self.btn_ok.clicked.connect(lambda: self.acted.emit("copy"))
+        lay.addWidget(self.btn_ok)
 
         self.set_color(color)
         self.set_width(width)
@@ -344,8 +348,10 @@ class SnipBar(QWidget):
     def _sep(self):
         f = QFrame()
         f.setFixedWidth(1)
-        f.setFixedHeight(18)
-        f.setStyleSheet("background:%s;border:none;" % self.pal.line.name())
+        f.setFixedHeight(14)
+        c = QColor(self.pal.line)
+        c.setAlpha(110)          # 分隔线调淡：1px 但看起来更细
+        f.setStyleSheet("background:%s;border:none;" % c.name(QColor.HexArgb))
         return f
 
     # -- 状态 ---------------------------------------------------------------
@@ -386,7 +392,10 @@ class SnipBar(QWidget):
         path = QPainterPath()
         path.addRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 9, 9)
         p.fillPath(path, QColor(self.pal.card))
-        p.setPen(QPen(QColor(self.pal.line), 1))
+        # 描边画细：0.75px + 半透明，比原来那圈实线轻一档
+        c = QColor(self.pal.line)
+        c.setAlpha(150)
+        p.setPen(QPen(c, 0.75))
         p.drawPath(path)
         p.end()
 
@@ -395,7 +404,7 @@ class WidthButton(ToolButton):
     """线宽按钮：画一个由细到粗的圆点，比写"细/中/粗"省地方。"""
 
     def __init__(self, width, tip, pal):
-        super(WidthButton, self).__init__("", tip, pal, checkable=True, size=26)
+        super(WidthButton, self).__init__("", tip, pal, checkable=True, size=28)
         self.line_width = width
 
     def paintEvent(self, e):

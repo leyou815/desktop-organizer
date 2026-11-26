@@ -9,9 +9,8 @@
   zhengli undo           撤销上一次操作（整理或批量改动）
   zhengli stat           分类统计
   zhengli snip           截图（没在跑就单开一个截图器）
-  zhengli pin            把剪贴板里的图钉到屏幕上
-  zhengli snipcopy       截图并直接复制
-  zhengli snipkeys on|off 截图快捷键总开关（关掉后 F1/F2/F3 归还给其它程序）
+  zhengli pin            把剪贴板里的图钉到屏幕上（有贴图时在显示/隐藏间切换）
+  zhengli snipkeys on|off 截图快捷键总开关（关掉后 F1/F3 归还给其它程序）
   zhengli panel 55       任务栏透明度设为 55%
   zhengli autohide on   任务栏自动隐藏（仅 Windows，图标零损失）
   zhengli glass on|off   玻璃质感开关
@@ -114,14 +113,6 @@ def cmd_snip():
     return 0
 
 
-def cmd_snipcopy():
-    if _send("snip-copy"):
-        print("已交给正在运行的「桌面整理」")
-        return 0
-    print("截图并复制需要主程序在跑，先执行：zhengli")
-    return 1
-
-
 def cmd_snipkeys(state):
     on = state == "on"
     cfg = appcfg.load()
@@ -132,12 +123,11 @@ def cmd_snipkeys(state):
         print("已交给正在运行的「桌面整理」处理")
     if on:
         g = cfg["general"]
-        print("截图快捷键已开启：%s 截图 / %s 截图并复制 / %s 固定尺寸 / %s 贴图 / %s 隐藏贴图"
-              % (g.get("snip_hotkey"), g.get("snip_copy_hotkey"),
-                 g.get("snip_fixed_hotkey"), g.get("pin_hotkey"),
-                 g.get("pin_toggle_hotkey")))
+        print("截图快捷键已开启：%s 截图 / %s 固定尺寸 / %s 贴图"
+              % (g.get("snip_hotkey"), g.get("snip_fixed_hotkey"),
+                 g.get("pin_hotkey")))
     else:
-        print("已关闭截图快捷键，F1/F2/F3 归还给其它程序（托盘菜单和主窗口按钮仍可截图）")
+        print("已关闭截图快捷键，F1/F3 归还给其它程序（托盘菜单和主窗口按钮仍可截图）")
     return 0
 
 
@@ -273,8 +263,7 @@ def main(argv):
     sub.add_parser("scan", help="预览归类结果")
     sub.add_parser("undo", help="撤销上一次操作（整理或批量改动）")
     sub.add_parser("snip", help="截图")
-    sub.add_parser("pin", help="贴图剪贴板")
-    sub.add_parser("snipcopy", help="截图并直接复制")
+    sub.add_parser("pin", help="贴图剪贴板（有贴图时在显示/隐藏间切换）")
     sp = sub.add_parser("snipkeys", help="截图快捷键总开关 on/off")
     sp.add_argument("state", choices=["on", "off"])
     sub.add_parser("stat", help="统计")
@@ -308,8 +297,6 @@ def main(argv):
         return cmd_snip()
     if args.cmd == "pin":
         return cmd_pin()
-    if args.cmd == "snipcopy":
-        return cmd_snipcopy()
     if args.cmd == "snipkeys":
         return cmd_snipkeys(args.state)
     if args.cmd == "stat":

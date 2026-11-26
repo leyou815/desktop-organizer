@@ -31,16 +31,15 @@ DEFAULTS = {
     "show_edge": "1",         # 屏幕右侧入口条
     "hotkey": "<Ctrl><Alt>G",
     "hotkey_enabled": "1",
-    # 截图（默认照 Snipaste 那套：F1 截图 / F2 截图并复制 / Shift+F1 固定尺寸 / F3 贴图 / Shift+F3 隐藏贴图）
+    # 截图（F1 截图 / Shift+F1 固定尺寸 / F3 贴图=显示隐藏循环）。
+    # F2「截图并复制」已删：完成键（对号）本身就复制，单独一个热键没有意义。
     "snip_dir": "",                      # 空 = 自动选 ~/图片/截图
     "snip_hotkey": "F1",
-    "snip_copy_hotkey": "F2",
     "snip_fixed_hotkey": "<Shift>F1",
     "pin_hotkey": "F3",
-    "pin_toggle_hotkey": "<Shift>F3",
     "snip_fixed_w": "800",
     "snip_fixed_h": "600",
-    # 截图热键总开关：关掉后 F1/F2/F3 还给其它程序用（浏览器 F1 帮助、F3 查找下一个）
+    # 截图热键总开关：关掉后 F1/F3 还给其它程序用（浏览器 F1 帮助、F3 查找下一个）
     "snip_hotkeys_on": "1",
     "snip_copy": "1",                    # 截完自动复制到剪贴板
     "snip_save": "0",                    # 截完自动存盘
@@ -69,14 +68,12 @@ def load():
         if k not in cfg["general"]:
             cfg["general"][k] = v
 
-    # 老配置（之前截图键是 Ctrl+Alt+A）迁移到 Snipaste 那套键位。
+    # 老配置（之前截图键是 Ctrl+Alt+A）迁移到现在的键位。
     # hotkey_scheme 只在迁移时写，用来判断"迁过了没有"。
     if "hotkey_scheme" not in cfg["general"] and os.path.isfile(CONFIG_FILE):
         cfg["general"]["snip_hotkey"] = "F1"
-        cfg["general"]["snip_copy_hotkey"] = "F2"
         cfg["general"]["snip_fixed_hotkey"] = "<Shift>F1"
         cfg["general"]["pin_hotkey"] = "F3"
-        cfg["general"]["pin_toggle_hotkey"] = "<Shift>F3"
         cfg["general"]["hotkey_scheme"] = "snipaste"
         save(cfg)       # 迁移结果立刻落盘，否则下次启动会反复迁移、覆盖用户改过的键位
 
