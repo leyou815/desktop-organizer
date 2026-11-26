@@ -12,3 +12,4 @@ venv/
 Thumbs.db
 selftest.txt
 tools/out/
+inject/target/

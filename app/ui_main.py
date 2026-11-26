@@ -20,7 +20,7 @@ from PyQt5.QtGui import (QColor, QPainter, QLinearGradient, QPainterPath, QPen,
                          QBrush, QIcon, QPixmap)
 from PyQt5.QtWidgets import (QWidget, QLabel, QPushButton, QSlider, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QFrame, QStackedWidget,
-                             QAbstractButton, QSizePolicy, QFileDialog)
+                             QAbstractButton, QSizePolicy, QFileDialog, QApplication)
 
 import launchers
 import rules
@@ -400,8 +400,7 @@ class MainWindow(QWidget):
         # 这里把两条真能用的路摆在前面，用户才不会反复拖滑块找那种"背景透、
         # 图标清晰"的效果——那个效果本工具给不了。
         if sysenv.IS_WINDOWS:
-            sub_text = ("Windows 改不了任务栏背景本身，只能二选一：\n"
-                        "自动隐藏，或整窗淡出")
+            sub_text = "三种形态，一次只能开一个"
         else:
             sub_text = "拉低就透出壁纸，磨砂质感始终保留"
         sub = QLabel(sub_text)
@@ -417,6 +416,37 @@ class MainWindow(QWidget):
         self.pct.setStyleSheet("color:%s;" % pal.accent.name())
         head.addWidget(self.pct)
         lay.addLayout(head)
+
+        # 注入全透明（Windows 独有，v1.0.6+）：真把任务栏背景摘掉，图标不受影响
+        self.inject_row = QWidget()
+        self.inject_row.setStyleSheet("background:transparent;")
+        r1 = QHBoxLayout(self.inject_row)
+        r1.setContentsMargins(0, 0, 0, 0)
+        r1t = QVBoxLayout()
+        r1t.setSpacing(1)
+        a1 = QLabel("任务栏完全透明")
+        a1.setStyleSheet("color:%s;font-size:13px;font-weight:600;" % pal.text.name())
+        b1 = QLabel("背景整块去掉、图标原样清晰（与 TranslucentTB 同机制）。"
+                    "杀软可能拦截，彻底卸载需重启资源管理器")
+        b1.setWordWrap(True)
+        b1.setStyleSheet("color:%s;font-size:10.5px;" % pal.muted.name())
+        r1t.addWidget(a1)
+        r1t.addWidget(b1)
+        r1.addLayout(r1t, 1)
+        self.sw_inject = Switch(pal)
+        self.sw_inject.toggled.connect(self._on_inject)
+        r1.addWidget(self.sw_inject, 0, Qt.AlignTop)
+        lay.addWidget(self.inject_row)
+        supports_inject = getattr(self.app.panel, "supports_inject", lambda: False)()
+        self.inject_row.setVisible(supports_inject)
+
+        # 只在注入模式显示：这一行回答"生效了吗"和"怎么彻底卸掉"两个必然会问的问题
+        self.inject_note = QLabel("已生效：任务栏背景交给壁纸，图标原样。资源管理器重启后会自动重连；"
+                                  "想彻底卸掉这份组件，重启一次资源管理器即可。")
+        self.inject_note.setWordWrap(True)
+        self.inject_note.setStyleSheet("color:%s;font-size:10.5px;" % pal.muted.name())
+        self.inject_note.setVisible(False)
+        lay.addWidget(self.inject_note)
 
         # 自动隐藏（Windows 独有）：这是外部程序唯一能做到"图标零损失"的办法
         self.autohide_row = QWidget()
@@ -533,13 +563,12 @@ class MainWindow(QWidget):
         lay.addWidget(self.blur_row)
         lay.addSpacing(4)
         if sysenv.IS_WINDOWS:
-            # 旧文案说"由亚克力合成"，实测在 Win11 上不成立（AccentPolicy 对
-            # 任务栏 XAML 表面无效）。改成与实现一致的说明，避免误导排查方向。
+            # 旧文案说"外部程序改不动任务栏背景"，v1.0.6 起我们自己把注入做出来了。
+            # 三种形态的代价必须写明白，否则用户会在"图标变淡"和"找不到任务栏"里犯懵。
             self.win_hint = self._hint_card(
-                "Windows 的任务栏背景由系统自己绘制，外部程序改不动它 —— 这也是"
-                "TranslucentTB 需要注入 explorer 才能做到真透明的原因。本工具用两条"
-                "可逆的路代替：自动隐藏（整条让位给壁纸，图标无损）或整窗淡出"
-                "（能透出桌面，但图标与文字一起变淡）。退出程序会自动还原。")
+                "任务栏背景由系统自己画，只有往 explorer 里送组件才能「完全透明」"
+                "（TranslucentTB 同理）。代价：杀软可能拦、卸载要重启资源管理器。"
+                "退出程序一律还原。")
             lay.addWidget(self.win_hint)
         else:
             lay.addWidget(self._hint_card(
@@ -1127,18 +1156,54 @@ class MainWindow(QWidget):
         except Exception as e:
             self.panel_status.setText("设置失败：%s" % e)
 
+    def _on_inject(self, on):
+        """真·全透明：走注入。失败时把开关弹回去并把原因说清楚，不留假状态。"""
+        try:
+            if on:
+                self.panel_status.setText("正在把透明组件送进资源管理器……")
+                QApplication.processEvents()      # 注入要等对方回应，先让这句话上屏
+                self.app.panel.set_taskbar_mode(self.app.panel.MODE_INJECT)
+            else:
+                self.app.panel.set_taskbar_mode(self.app.panel.MODE_FADE)
+            self.app.save_cfg()
+            if not on:
+                self._apply_slider_range()
+                self._sync_panel(self.app.panel.get_alpha())
+            self._apply_mode_ui()
+            self.panel_status.setText(
+                "任务栏已完全透明：背景交给壁纸，图标不受影响。"
+                "资源管理器重启后会自动重连" if on
+                else "已恢复：透明画刷已还回系统，任务栏回到下面的滑块控制")
+        except Exception as e:
+            self.panel_status.setText("设置失败：%s" % e)
+            self._apply_mode_ui()          # 以真实状态回同步，别让开关停在"开"
+
     def _apply_mode_ui(self):
-        """按当前实际状态同步界面：开关位置、淡出组是否可见、第三方工具提示。"""
+        """按当前实际状态同步界面：开关位置、各组是否可见、第三方工具提示。"""
         try:
             auto = bool(self.app.panel.get_autohide()) if self.app.panel.supports_autohide() else False
         except Exception:
             auto = False
+        try:
+            mode = self.app.panel.taskbar_mode()
+        except Exception:
+            mode = "fade"
+        inj = mode == getattr(self.app.panel, "MODE_INJECT", "inject")
         if hasattr(self, "sw_autohide"):
             self.sw_autohide.set_silent(auto)
+        if hasattr(self, "sw_inject"):
+            self.sw_inject.set_silent(inj)
+        if hasattr(self, "inject_note"):
+            self.inject_note.setVisible(inj)
+        if hasattr(self, "autohide_row"):
+            # 注入模式下另外两套都收起：同时出现只会让人以为能叠着用
+            self.autohide_row.setVisible(self.app.panel.supports_autohide() and not inj)
         if hasattr(self, "fade_box"):
-            self.fade_box.setVisible(not auto)
+            self.fade_box.setVisible(not auto and not inj)
         if hasattr(self, "pct"):
-            self.pct.setVisible(not auto)
+            self.pct.setVisible(not auto and not inj)
+        if hasattr(self, "glass_row"):
+            self.glass_row.setVisible(not inj)      # 玻璃质感对注入模式没意义
         if hasattr(self, "tools_hint"):
             try:
                 tools = self.app.panel.running_taskbar_tools()

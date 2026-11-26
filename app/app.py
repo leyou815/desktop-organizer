@@ -59,8 +59,13 @@ class App(QObject):
             self.panel.apply_glass()
             self.panel.pin_popups()
         except PanelError as e:
-            self._panel_ok = False
-            self._panel_err = str(e)
+            # 注入模式下失败（杀软拦截、组件被删）不该把整个任务栏页判死刑：
+            # 另外两种形态仍然可用，界面必须能打开让人改回去。
+            if getattr(self.panel, "taskbar_mode", lambda: "")() == "inject":
+                self._panel_err = str(e)
+            else:
+                self._panel_ok = False
+                self._panel_err = str(e)
 
         self.win = MainWindow(self)
         self.drawer = Panel(self.org, self.pal, cfg=self.cfg,
@@ -91,6 +96,10 @@ class App(QObject):
         self._keep.start()
         if not self._panel_ok:
             self.win.panel_status.setText("任务栏设置不可用：%s" % getattr(self, "_panel_err", ""))
+        elif getattr(self, "_panel_err", ""):
+            self.win.panel_status.setText(
+                "完全透明这次没生效：%s（可以先换成自动隐藏或整窗淡出）"
+                % self._panel_err)
 
     # ------------------------------------------------------------------ 入口
     def start(self, show_window=None):

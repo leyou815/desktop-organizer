@@ -1,0 +1,19 @@
+[package]
+name = "do_inject"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+# 故意不依赖 windows crate：XAML Diagnostics（xamlom.h 那套接口）不在 Win32 metadata 里，
+# 拿不到绑定；反正整条链路只有十来个 COM 调用，手写 vtable 反而更可控、编译只要 1 秒。
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+strip = true
+codegen-units = 1
+# 不用 panic="abort"：这个 DLL 跑在 explorer 里，panic 直接 abort 会把资源管理器带走。
+panic = "unwind"

@@ -15,28 +15,24 @@
 
 **麒麟**：滑块 0–100%，写 `gsettings`，**背景真透明、图标清晰**，改完立刻生效。
 
-**Windows**：两种形态，二选一（互斥，切换时自动把另一种摘干净）
+**Windows**：三种形态，任选一种（互斥，切换时自动把另外两种摘干净）
 
 | 形态 | 效果 | 代价 |
 |---|---|---|
-| **自动隐藏**（推荐） | 整条让位给壁纸，鼠标碰底边才滑出来 | 无，图标零损失，系统原生、随时可逆 |
+| **完全透明**（v1.0.6+） | 背景整块去掉，透出壁纸，**图标原样清晰** | 要往 explorer 送一个组件；杀软可能拦截；彻底卸载需重启资源管理器 |
+| **自动隐藏** | 整条让位给壁纸，鼠标碰底边才滑出来 | 无，图标零损失，系统原生、随时可逆 |
 | **整窗淡出**（55%–100%） | 能透出桌面 | 图标与文字等比一起变淡 |
 
-- 四档预设：浓雾 / 磨砂 / 玻璃 / 通透
+- 四档预设：浓雾 / 磨砂 / 玻璃 / 通透（淡出形态下可用）
 - 实时预览卡：把"任务栏叠在壁纸上"的样子画出来，拖滑块即时可见
 - 检测到 TranslucentTB 正在运行时会给出提示：两者改的是同一块任务栏，同时开启会互相覆盖
 
-> **为什么 Windows 上纯外部程序做不到「背景透、图标清晰」**
+> **为什么只有注入能做到「背景透、图标清晰」**
 >
-> 读过 TranslucentTB 的源码（`ExplorerTAP/taskbarappearanceservice.cpp`）：
-> 它注入 explorer 后，拿到任务栏背景那个 XAML `Shape`，直接 `Fill(newBrush)` 换掉画刷，
-> 并 `SetWindowSubclass` 任务栏窗口在 `WM_PAINT` 里涂黑客户区。这些动作全部发生在
-> **explorer 进程内部**，外部调用 `SetWindowCompositionAttribute` 完全没有机会参与。
-> 它是签过名的开源项目（`ExplorerTAP` + `ExplorerHooks` 两个注入 DLL），所以杀软不拦；
-> 纯 Python 复刻不了这条路径（要 C++ DLL + COM proxy/stub + WinRT XAML 访问 + 代码签名）。
->
-> Win11 10.0.26200（25H2）实测，外部能试的路全部无效 —— 取样任务栏
-> 2560×60 物理像素，用均亮度 / 标准差 / 图标对比度三个指标卡：
+> 任务栏背景不是一个窗口颜色，而是 explorer 进程里的一块 XAML `Rectangle`
+> （元素名 `BackgroundFill`），和图标画在**同一棵视觉树**上。实测（Win11 10.0.26200）
+> 隐藏背景所在的子窗口 `DesktopWindowContentBridge`，结果整条变纯色 103、
+> 标准差 0.00、图标对比度 0.0 —— 背景和图标拆不开。所以进程外的路全死了：
 >
 > | 尝试 | 结果 |
 > |---|---|
@@ -45,24 +41,17 @@
 > | `DwmEnableBlurBehindWindow` | 38.09 → 39.68，噪声级 |
 > | 注册表 `TaskbarAcrylicOpacity`（0 / 200，各重启一次 explorer） | 零变化 |
 > | 色键透明（`WS_EX_LAYERED` + `LWA_COLORKEY`） | 零变化，DComp 内容不走重定向表面 |
-> | 隐藏 XAML 子窗口 `DesktopWindowContentBridge` | 整条变纯色 103、标准差 0.00、图标对比度 0.0 |
 >
-> 最后一行是关键：图标和背景在**同一个视觉树**里，隐藏背景层连图标一起消失，
-> 所以"只摘背景"这条路从进程外不存在。
+> TranslucentTB 的做法是注入：`SetWindowsHookEx` 把 DLL 送进 explorer，经 XAML
+> Diagnostics 拿到视觉树，把 `BackgroundFill` 的 `Fill` 换成空画刷。
+> **v1.0.6 起本工具也走这条路**——`inject/` 是一个零依赖的 Rust DLL，机制相同、
+> 代码自己写（没抄 TTB）。实测：背景真的消失（任务栏与上方壁纸像素连续，无台阶），
+> 图标不受影响，随时可还原。
 >
-> **AccentState 常量容易记错**（TranslucentTB 的 `Common/undoc/user32.hpp`）：
-> `1 = GRADIENT`（alpha 被忽略）、`2 = TRANSPARENTGRADIENT`（Clear，用 alpha）、
-> `3 = BLURBEHIND`、`4 = ACRYLICBLURBEHIND`。网上很多资料把 2 写成 blur，会试错一轮。
->
-> 另外两条实测数据，供判断"淡出"值不值：
->
-> | 不透明度 | 任务栏背景亮度 | 图标对比度 |
-> |---|---|---|
-> | 100%（系统原样） | 37.3 | 31.0 |
-> | 80% | 33.5 | 24.2 |
-> | 55%（下限） | 约 24 | 约 21 |
->
-> 图标掉约三成、背景只透出一点点 —— 所以把自动隐藏放在前面推荐。
+> 代价说清楚：DLL 没有代码签名，部分杀软会拦这类"往 explorer 注入"的行为；
+> `InitializeXamlDiagnosticsEx` 会把 DLL 钉在 explorer 里（文件删不掉），
+> 想彻底卸掉就重启一次资源管理器。这些都在界面上写明了。
+
 
 ![任务栏](assets/main-panel.png)
 
@@ -143,7 +132,7 @@
 
 | 能力 | 麒麟 V10 SP1（UKUI） | Windows 11（10.0.26200） |
 |---|---|---|
-| 任务栏透明度 | `gsettings` 三键（0~100%），背景真透明图标清晰 | 自动隐藏（推荐）或整窗淡出 55%~100%；Win10 走 accent，可做到背景透、图标清晰 |
+| 任务栏透明度 | `gsettings` 三键（0~100%），背景真透明图标清晰 | **完全透明（注入）** 已实测；另有自动隐藏、整窗淡出 55%~100% 两条备选。Win10 走 accent，可做到背景透、图标清晰 |
 | 桌面文件整理 | ✅ 已实测 | 逻辑平台无关，自检通过（未做真实整理） |
 | 抽屉 / 搜索 / 托盘 | ✅ 已实测 | 托盘可用性自检通过 |
 | 桌面图标（应用） | `.desktop` | `.lnk` / `.url`（图标读取已实测） |
@@ -187,6 +176,11 @@ python install_windows.py
 ```bat
 build_windows.bat
 ```
+
+> 打包前必须存在 `tap\do_inject.dll`（任务栏「完全透明」用的注入组件）。
+> 仓库里已经带了一份编好的，直接打包即可；想从源码重编就装好 Rust 后跑
+> `inject\build.bat`（`cargo build --release` 后自动拷到 `tap\`）。
+> 源码在 `inject\src\lib.rs`，零第三方 crate，rustc 自带链接器就能出 DLL。
 
 卸载：`python uninstall_windows.py`（只删程序，已归档的文件不动）
 
@@ -467,7 +461,7 @@ UI（`ui_main.py` / `ui_drawer.py`）完全平台无关。
 
 | 关注点 | 麒麟 | Windows |
 |---|---|---|
-| 任务栏透明度 | `org.ukui.control-center.personalise:transparency`（0~1），写入实时生效 | 形态二选一：`SHAppBarMessage(ABM_SETSTATE)` 自动隐藏，或 `WS_EX_LAYERED` + `SetLayeredWindowAttributes` 整窗 alpha（140~255）；Win10 另有 `ACCENT_POLICY` 的 alpha（0~255） |
+| 任务栏透明度 | `org.ukui.control-center.personalise:transparency`（0~1），写入实时生效 | 三形态互斥：注入全透明（`tap/do_inject.dll` + XAML Diagnostics）、`SHAppBarMessage(ABM_SETSTATE)` 自动隐藏、`WS_EX_LAYERED` + `SetLayeredWindowAttributes` 整窗 alpha（140~255）；Win10 另有 `ACCENT_POLICY` 的 alpha（0~255） |
 | 磨砂强度 | `personalise:blurry` 有低/中/高三档 | 无对应概念，该行控件在 Windows 上自动隐藏 |
 | 玻璃质感开关 | `effect=true`、`enabled-global-blur=true`、`blurry` 三项每次重写 | **自动隐藏**：任务栏的磨砂由系统「透明效果」统一控制，这个开关按了没有可见变化 |
 | 任务栏窗口 | QML 面板，改键即刷新 | `Shell_TrayWnd` + `Shell_SecondaryTrayWnd`；资源管理器重启后句柄失效，句柄变了重设，layered 位被冲掉也补回 |
@@ -476,15 +470,27 @@ UI（`ui_main.py` / `ui_drawer.py`）完全平台无关。
 | 隐藏判定 | 点开头 | 点开头 + `FILE_ATTRIBUTE_HIDDEN/SYSTEM` |
 | 全局快捷键 | X11 `XGrabKey` + `QSocketNotifier` | `RegisterHotKey` + `QAbstractNativeEventFilter` |
 
-**为什么 Windows 只能整窗淡出**：`SetWindowCompositionAttribute` 长期被当成
+**为什么 v1.0.5 之前 Windows 只能整窗淡出**：`SetWindowCompositionAttribute` 长期被当成
 "任务栏透明"的正解（TranslucentTB 早期确实这么干），但在 Win11 10.0.26200 上
 它打不穿 XAML 层 —— state 1/2/3/4/5 配任意 alpha，背景亮度只动 1~2 级；
 `DWMWA_SYSTEMBACKDROP_TYPE` 和注册表 `TaskbarAcrylicOpacity` 同样无效。
 
-所以 Win11 给了两种形态，都不碰背景本身：
+**v1.0.6 起有了第一条真正有效的**：`inject/` 里的 Rust DLL（零依赖手写 COM vtable，
+`crate-type = ["cdylib"]`，rustc 自带 lld 就能链接）由 `app/taskbar_tap.py` 通过
+`SetWindowsHookEx(WH_CALLWNDPROC)` 送进 explorer，走 XAML Diagnostics 拿到
+`Taskbar.TaskbarBackground` 下的 `BackgroundFill` / `BackgroundStroke` 两个 Rectangle，
+把 `Fill` 置空。要点都写在 `inject/src/lib.rs` 的注释里，其中两条最容易踩：
+
+- `IShape` 的 vtable 是 `IInspectable` 基类（`get_Fill` 在**第 6 槽**），而
+  `IXamlDiagnostics` 是 `: public IUnknown`（`GetIInspectableFromHandle` 在第 6 槽）——
+  两套规矩不能混用，混错的后果是 explorer 当场崩
+- 视觉树回调里不要同步碰 XAML 对象：回调只记 handle，用消息甩到 UI 线程的
+  消息循环（模块内建的 HWND_MESSAGE 窗口）里再动手
+
+另外两种形态仍然保留，都不碰背景本身：
 **自动隐藏**（`ABM_SETSTATE`，整条让位给壁纸，图标零损失，实测即时生效、可逆）和
 **整窗淡出**（`WS_EX_LAYERED` + `SetLayeredWindowAttributes`，线性可逆、退出时把扩展样式
-原样还回去；代价是图标文字等比变淡，下限因此设在 55%）。两者互斥，切换时自动摘干净另一种。
+原样还回去；代价是图标文字等比变淡，下限因此设在 55%）。三种互斥，切换时自动摘干净另外两种。
 Win10（build < 22000）保留 accent 分支，那边 alpha 真的有效，只压背景不动图标。
 
 ## 验证情况
@@ -558,11 +564,22 @@ Win10（build < 22000）保留 accent 分支，那边 alpha 真的有效，只�
 > 老配置用 `cfg_ver` 迁移一次（那个 `0` 是当年的默认值、不是用户的选择），
 > 设置页开关仍可随时关掉。
 
+> **v1.0.6：Windows 也做到「真·完全透明」了**。上一版说"本工具不注入"，
+> 这次把注入做出来了：`inject/` 是一个零依赖 Rust DLL，走 XAML Diagnostics（和
+> TranslucentTB 同一机制，代码重写），由 `app/taskbar_tap.py` 用钩子送进 explorer，
+> 把 `BackgroundFill` / `BackgroundStroke` 的 `Fill` 置空，原画刷带引用存着以便还原。
+> 实测（2560×1440 @125%）：任务栏区域与上方壁纸像素完全连续、无台阶，图标不受影响；
+> 还原后回到原来的亚克力底色。踩坑记录留在 `inject/src/lib.rs`：
+> `IShape` 的 vtable 是 `IInspectable` 基类（`get_Fill` 在第 6 槽），按 `IUnknown`
+> 算成第 3 槽会调到 `GetIids`、往野指针写 IID 数组，explorer 当场崩；
+> 视觉树回调里不能同步碰 XAML 对象，得把 handle 甩到 UI 线程消息循环再动手。
+> 顺带修了两个存量问题：explorer 会把 `WS_EX_LAYERED` 加回去但 alpha 归 255，
+> 现在巡检比 alpha 而不是只比标志位；程序被强杀后残留的透明画刷，下次启动会先清一次。
+
 ## 已知限制
 
 1. **Windows 的"整窗淡出"会连图标文字一起变淡**（整窗混合的必然结果），下限 55%；
-   想要"背景透、图标实"，请用自动隐藏，或者装 TranslucentTB —— 它靠注入 explorer 实现，
-   本工具不注入。
+   想要"背景透、图标实"，请用「完全透明」（v1.0.6+，注入 explorer 换画刷）或「自动隐藏」。
 2. Windows 没有"磨砂强度"分级，也没有可用的"玻璃质感"开关（按了没有可见变化），这两行控件会自动隐藏。
 3. 文件分类靠扩展名，改了后缀会归错（文件夹按目录判断，快捷方式按类型判断，不受影响）。
 4. 「此电脑 / 回收站 / 主目录」不是文件，只能靠系统开关隐藏，无法真正归档。
@@ -571,8 +588,10 @@ Win10（build < 22000）保留 accent 分支，那边 alpha 真的有效，只�
 7. **截图只覆盖鼠标所在的那块屏幕**。多屏时不能跨屏拖一个选区——真要做需要多窗口联动，复杂度不值得。
 8. **桌面特效关闭时截出来可能是黑的**（拿不到桌面背景）。程序会提示，但不会替你打开特效。
 9. 截图复制到剪贴板依赖系统的剪贴板管理器（麒麟自带）。如果主程序退出后剪贴板内容消失，说明系统没有常驻管理器。
-10. **Windows 做不到"只透背景"**：任务栏背景和图标在 explorer 的同一个 XAML 视觉树里，
-    外部程序改不动（实测隐藏背景层连图标一起消失）。可用手段只有自动隐藏与整窗淡出两种。
+10. **"只透背景"必须注入 explorer，没有纯外部做法**：任务栏背景和图标在同一个 XAML
+    视觉树里（实测隐藏背景层连图标一起消失）。v1.0.6 起本工具自带一个注入组件来做到这点，
+    代价是：DLL 没有代码签名，部分杀软会拦；它会被 XAML 钉在 explorer 里（文件删不掉），
+    想彻底卸掉要重启一次资源管理器。不想注入就用自动隐藏或整窗淡出。
 11. **公共桌面（`C:\Users\Public\Desktop`）默认纳入整理**，但那个目录只给了删除权限、没给写入权限：
     撤销时图标会放回你自己的桌面，而不是公共桌面（要真的写回公共桌面，需要管理员）。
     设 置 里关掉「整理公共桌面快捷方式」可以恢复"只整理自己的桌面"。

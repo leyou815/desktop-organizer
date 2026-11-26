@@ -19,15 +19,20 @@
 TranslucentTB 能做到「背景透明 + 图标清晰」，源码（ExplorerTAP）显示它注入
 explorer 后拿到任务栏背景那个 XAML Shape，直接换掉 Fill 画刷，并 subclass
 任务栏窗口在 WM_PAINT 里涂黑客户区 —— 全部发生在 explorer 进程内部。
-它是签过名的知名项目，所以杀软不拦；但纯 Python 复刻不了这条路径
-（需要 C++ DLL + COM proxy/stub + WinRT XAML 访问 + 代码签名）。
+它是签过名的知名项目，所以杀软不拦。
 
-因此 Win11 上外部真正可达的只有两条：
-  A. 自动隐藏（推荐）：系统原生，整条让位给壁纸，图标零损失，可逆
-  B. WS_EX_LAYERED 整窗不透明度：能透出桌面，但图标与文字等比变淡
+v1.0.6 起本程序也走这条路了：`inject/` 下是一个零依赖的 Rust DLL（走 XAML
+Diagnostics，和 TTB 同一机制但代码是重写的），由 taskbar_tap.py 送进 explorer。
+实测 Win11 26200 上背景真正消失、图标不受影响，且能原样还原。
+
+三条路（互斥，按用户选择走一条）：
+  A. 注入全透明（v1.0.6+）：真透，背景交给壁纸，图标零损失；代价是要往 explorer
+     塞一个 DLL（杀软可能拦），且卸载得等 explorer 重启
+  B. 自动隐藏：系统原生，整条让位给壁纸，图标零损失，可逆
+  C. WS_EX_LAYERED 整窗不透明度：能透出桌面，但图标与文字等比变淡
 
 Win10（build < 22000）上 AccentPolicy 的 alpha 仍然有效，走 accent 分支，
-可以做到「背景透、图标清晰」；Win11 才被迫走上面两条。
+可以做到「背景透、图标清晰」；Win11 才需要上面三条。
 
 流程：
   1. 确保「设置 → 个性化 → 颜色 → 透明效果」是开的（EnableTransparency=1）
@@ -39,6 +44,7 @@ Win10（build < 22000）上 AccentPolicy 的 alpha 仍然有效，走 accent 分
 import ctypes
 import os
 import sys
+import time
 from ctypes import wintypes
 
 import sysenv
@@ -58,6 +64,7 @@ WCA_ACCENT_POLICY = 19
 
 # 与麒麟版共用同一份常量/异常，避免两套定义各自漂移
 from panel_core import PanelError, PRESETS, BLUR_NAMES  # noqa: E402
+import taskbar_tap as tap  # noqa: E402
 
 
 if IS_WINDOWS:
@@ -247,6 +254,29 @@ def _set_opacity(hwnd, level):
         return False
 
 
+def _get_opacity(hwnd):
+    """读回 layered 的实际 alpha（0~255）。不是 layered 或读不到返回 None。
+
+    实测：explorer 会自己把 WS_EX_LAYERED 加回去（任务栏本来就用它做合成），
+    但 alpha 会被重置成 255。所以「有 layered 标志」不等于「我们的透明度还在」，
+    巡检必须比 alpha，否则淡出会静默失效、用户只看到任务栏莫名其妙变实。
+    """
+    try:
+        _user32.GetLayeredWindowAttributes.argtypes = [
+            wintypes.HWND, ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(wintypes.DWORD)]
+        _user32.GetLayeredWindowAttributes.restype = wintypes.BOOL
+        key = wintypes.DWORD()
+        alpha = ctypes.c_ubyte()
+        flags = wintypes.DWORD()
+        if not _user32.GetLayeredWindowAttributes(hwnd, ctypes.byref(key),
+                                                  ctypes.byref(alpha), ctypes.byref(flags)):
+            return None
+        return int(alpha.value)
+    except Exception:
+        return None
+
+
 def _clear_opacity(hwnd, orig_ex):
     """还原：先回满不透明，再把 layered 标志摘掉。"""
     try:
@@ -310,6 +340,15 @@ class PanelWin(object):
         self._backed_up = False     # 原值只记一次，别每次贴 accent 都覆盖成"已改过"的值
         self._transparency_ok = False   # "透明效果"已经确保开启过，不必每次拖滑块都写注册表
         self._ex_style = {}             # hwnd -> 动它之前的扩展样式，退出时按原样还回去
+        self._tap_try = 0.0             # 上次尝试重新注入的时刻（限速用）
+        # 上次可能是崩溃/被强杀，透明画刷还留在 explorer 里：启动时先无条件还原一次。
+        # 否则用户会看到一条透空的任务栏，却完全不知道是谁改的、怎么改回去。
+        # 组件不在（explorer 重启过）时这是空操作，代价只有一次文件写入。
+        try:
+            if self.taskbar_mode() != self.MODE_INJECT:
+                tap.restore(timeout=1.5)
+        except Exception:
+            pass
 
     # -- 能力 ---------------------------------------------------------------
     def supports_blur_level(self):
@@ -321,18 +360,22 @@ class PanelWin(object):
     def info(self):
         hwnds = _taskbars()
         mode = self.taskbar_mode()
+        names = {self.MODE_AUTOHIDE: "自动隐藏", self.MODE_INJECT: "注入全透明"}
         info = {
             "平台": "Windows",
             "任务栏窗口": "%d 个" % len(hwnds) if hwnds else "未找到",
-            "形态": "自动隐藏" if mode == self.MODE_AUTOHIDE else "整窗淡出",
+            "形态": names.get(mode, "整窗淡出"),
         }
         if mode == self.MODE_AUTOHIDE:
             info["自动隐藏"] = "已开启" if self.get_autohide() else "未生效"
+        elif mode == self.MODE_INJECT:
+            info["注入组件"] = "已连上" if tap.is_active() else "未连上"
+            info["组件来源"] = tap.dll_source() or "缺失"
         else:
             info["透明度"] = "%d%%" % int(self.get_alpha() * 100)
         info["系统透明效果"] = {True: "开", False: "关", None: "读不到"}[_transparency_enabled()]
-        info["已应用"] = "是" if self._applied else ("否（自动隐藏不需要）"
-                                                    if mode == self.MODE_AUTOHIDE else "否")
+        info["已应用"] = "是" if self._applied else (
+            "否（这一形态不需要）" if mode in (self.MODE_AUTOHIDE, self.MODE_INJECT) else "否")
         tools = _running_taskbar_tools()
         if tools:
             info["第三方工具"] = "、".join(tools) + "（会互相覆盖，建议只留一个）"
@@ -379,13 +422,26 @@ class PanelWin(object):
         self.apply_glass()      # 透明度必须落到窗口上，因此不看 sync_glass
         return value
 
-    # -- 任务栏形态（Windows 特有的第二条路）--------------------------------
+    # -- 任务栏形态（Windows 特有的两条路）--------------------------------
     MODE_FADE = "fade"
     MODE_AUTOHIDE = "autohide"
+    MODE_INJECT = "inject"
+
+    def supports_inject(self):
+        """能不能做「真·全透明」：得有注入组件，而且得是 Windows。
+
+        组件缺失（老版本安装包、杀软删了文件）时界面直接不显示这一项，
+        而不是让用户打开开关之后看到一句报错。
+        """
+        return bool(IS_WINDOWS and tap.dll_source())
 
     def taskbar_mode(self):
         v = str(self.cfg["general"].get("taskbar_mode") or self.MODE_FADE).strip().lower()
-        return self.MODE_AUTOHIDE if v == self.MODE_AUTOHIDE else self.MODE_FADE
+        if v == self.MODE_AUTOHIDE:
+            return self.MODE_AUTOHIDE
+        if v == self.MODE_INJECT:
+            return self.MODE_INJECT
+        return self.MODE_FADE
 
     def supports_autohide(self):
         return bool(IS_WINDOWS and _taskbars())
@@ -409,10 +465,40 @@ class PanelWin(object):
         return self.get_autohide() == bool(on)
 
     def set_taskbar_mode(self, mode):
-        """两种形态互斥：自动隐藏开着时再把任务栏调半透明会打架，必须先摘干净。"""
-        mode = self.MODE_AUTOHIDE if mode == self.MODE_AUTOHIDE else self.MODE_FADE
+        """三种形态互斥：同一时刻只能有一种在管任务栏。
+
+        自动隐藏 / 整窗淡出 / 注入全透明 都会改动同一块表面，叠在一起必然互相覆盖
+        （例如注入了还开着 layered，透明就变成"壁纸 × 半透明"的浑浊色）。
+        所以切到哪个，先把另外两个摘干净。
+        """
+        if mode not in (self.MODE_AUTOHIDE, self.MODE_INJECT):
+            mode = self.MODE_FADE
+        prev = self.taskbar_mode()
         self.cfg["general"]["taskbar_mode"] = mode
-        if mode == self.MODE_AUTOHIDE:
+
+        if prev == self.MODE_INJECT and mode != self.MODE_INJECT:
+            # 离开注入模式：先把画刷还回去，再卸别的
+            try:
+                tap.restore()
+            except Exception:
+                pass
+        elif mode != self.MODE_INJECT:
+            # 即便配置里没记着注入，explorer 里也可能还留着透明画刷（上次崩溃）：
+            # 切到别的形态时顺手清一次，成本只是一次文件写 + 一次日志比对。
+            try:
+                tap.restore(timeout=1.0)
+            except Exception:
+                pass
+
+        if mode == self.MODE_INJECT:
+            self._drop_opacity()
+            self.set_autohide(False)
+            ok, err = tap.apply_clear()
+            if not ok:
+                # 注入失败就把配置退回去，别留下"开关是开的、任务栏没变"的脏状态
+                self.cfg["general"]["taskbar_mode"] = prev
+                raise PanelError(err)
+        elif mode == self.MODE_AUTOHIDE:
             self._drop_opacity()
             self.set_autohide(True)
         else:
@@ -469,6 +555,11 @@ class PanelWin(object):
         hwnds = _taskbars()
         if not hwnds:
             return False, "找不到任务栏窗口（Shell_TrayWnd）"
+
+        if self.taskbar_mode() == self.MODE_INJECT:
+            # 注入模式下画刷由 explorer 里的组件管，这里什么都不该碰：
+            # 一贴 layered 就把"真透明"糊成半透明，前面注入的功夫全废。
+            return tap.apply_clear()
 
         if self.taskbar_mode() == self.MODE_AUTOHIDE:
             # 自动隐藏模式下不再叠加整窗透明：两者一起用会既看不见任务栏、
@@ -529,10 +620,23 @@ class PanelWin(object):
         return False, err or "设置任务栏透明度失败"
 
     def keep_alive(self):
-        """资源管理器重启会换句柄，另外它自己也可能把 layered 标志冲掉。"""
+        """资源管理器重启会换句柄，另外它自己也可能把 layered 标志冲掉。
+
+        注入模式还有第三种失效：explorer 重启 = 我们送进去的 DLL 跟着一起没了。
+        这时要重新注入，但必须限速——杀软如果一直拦，每 4 秒硬试一次会让界面卡成幻灯片。
+        """
         if not IS_WINDOWS:
             return
         hwnds = tuple(_taskbars())
+        if self.taskbar_mode() == self.MODE_INJECT:
+            try:
+                if not tap.is_active() and time.time() - self._tap_try > 20.0:
+                    self._tap_try = time.time()
+                    tap.apply_clear()
+            except Exception:
+                pass
+            self._last_hwnds = hwnds
+            return
         if self.taskbar_mode() == self.MODE_AUTOHIDE:
             # 自动隐藏不靠 layered；只在被系统改动过时补一次（explorer 重启、
             # 用户在设置里手动关掉），不必每 4 秒重写一次 AppBar 状态。
@@ -546,10 +650,13 @@ class PanelWin(object):
         if hwnds != self._last_hwnds:
             self.apply_glass()
             return
-        # 句柄没变但 layered 位没了（explorer 重绘/主题切换），补一次
+        # 句柄没变，但我们的透明度可能被冲掉了：explorer 重绘/主题切换会把
+        # layered 标志加回来而 alpha 归 255。比起只查标志位，直接比 alpha 才靠谱。
+        want = int(round(self.get_alpha() * 255))
         for h in hwnds:
             try:
-                if not (_get_exstyle(h) & WS_EX_LAYERED):
+                got = _get_opacity(h)
+                if got is None or abs(got - want) > 6:
                     self.apply_glass()
                     return
             except Exception:
@@ -576,6 +683,14 @@ class PanelWin(object):
         自动隐藏是用户自己选的一项系统设置，这里不动它 —— 退出程序不该把
         用户设成"碰底边才出来"的用法改回常驻。
         """
+        # 注入模式：先把画刷放回去（这一步依赖 explorer 里那份 DLL 还活着）。
+        # 不判断当前 mode —— 上次可能异常退出、配置没落盘，但任务栏还留着透明；
+        # 无条件喊一声"还原"最省事，组件不在的时候它自己会立刻返回。
+        try:
+            tap.restore()
+        except Exception:
+            pass
+
         self._drop_opacity()
 
         for h in _taskbars():

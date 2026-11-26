@@ -62,8 +62,8 @@ def copy_files(src, dst):
     任何一步失败都不动原安装。
     """
     print("==> 安装到 %s" % dst)
-    names = [n for n in ("app", "assets") if os.path.isdir(os.path.join(src, n))]
-    if not names:
+    names = [n for n in ("app", "assets", "tap") if os.path.isdir(os.path.join(src, n))]
+    if "app" not in names:
         raise RuntimeError("源码目录里找不到 app/，可能是在错误的目录下运行")
 
     tmp = dst + ".new"
