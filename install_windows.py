@@ -43,9 +43,9 @@ def pythonw(exe=None):
 def _is_private_python(exe):
     """判断是不是「某个工具自带的」Python。
 
-    WorkBuddy／绿色版工具的内置解释器长这样：
+    IDE／工具链往往内置一份私有解释器，路径形如：
         C:\\Users\\X\\.workbuddy\\binaries\\python\\versions\\3.13.12\\python.exe
-    这类路径会随工具升级换版本号（3.13.12 → 3.13.15），写进快捷方式后一旦升级
+    这类路径会随宿主升级换版本号（3.13.12 → 3.13.15），写进快捷方式后一旦升级
     就变成死链 —— 双击没反应，用户完全查不出原因。所以装的时候要主动绕开。
     """
     p = os.path.normcase(os.path.abspath(exe))
