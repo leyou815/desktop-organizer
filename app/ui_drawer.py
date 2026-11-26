@@ -518,6 +518,146 @@ class ResultRow(QWidget):
         p.end()
 
 
+class SubHeader(QWidget):
+    """二级分类的一行：树状缩进 + 名字 + 数量 + 展开箭头。
+
+    比一级的 CatHeader 轻一档：不高亮方块、不带说明文字，
+    一眼能看出「这是文档底下的 Excel，不是另一个大分类」。
+    """
+
+    toggled = pyqtSignal()
+
+    def __init__(self, pal, name, count):
+        super(SubHeader, self).__init__()
+        self.pal = pal
+        self.name = name
+        self.count = count
+        self.expanded = False
+        self.setFixedHeight(24)
+        self.setCursor(Qt.PointingHandCursor)
+        self._hover = False
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.toggled.emit()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        if self._hover:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 14) if self.pal.dark else QColor(0, 0, 0, 9))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(2, 1, -2, -1), 5, 5)
+
+        # 树状引导线：竖线从上一行穿下来，再折一小段横线指向名字
+        line = QColor(self.pal.muted)
+        line.setAlpha(70)
+        p.setPen(QPen(line, 1))
+        p.drawLine(10, 0, 10, h // 2)
+        p.drawLine(10, h // 2, 17, h // 2)
+        if self.expanded:
+            # 展开时竖线继续往下，把下面的文件串在这一支上
+            p.drawLine(10, h // 2, 10, h)
+
+        tail = "%d" % self.count if self.count else "空"
+        fm_tail = QFontMetrics(self.pal.font_mono(9.5))
+        tw = fm_tail.horizontalAdvance(tail)
+
+        f_name = self.pal.font_ui(12)
+        fm_name = QFontMetrics(f_name)
+        avail = w - 22 - tw - 34
+        shown = fm_name.elidedText(self.name, Qt.ElideRight, int(avail))
+        p.setFont(f_name)
+        p.setPen(QPen(self.pal.text))
+        p.drawText(QRectF(22, 0, avail, h), Qt.AlignVCenter | Qt.AlignLeft, shown)
+
+        # 数量紧跟名字，别贴到箭头边上去（那样看着像「2 v」）
+        nw = fm_name.horizontalAdvance(shown)
+        p.setFont(self.pal.font_mono(9.5))
+        p.setPen(QPen(self.pal.muted))
+        p.drawText(QRectF(22 + nw + 8, 0, tw + 4, h),
+                   Qt.AlignVCenter | Qt.AlignLeft, tail)
+
+        # 箭头
+        p.setPen(QPen(self.pal.muted, 1.4))
+        cx, cy = w - 14.0, h / 2.0
+        if self.expanded:
+            p.drawLine(int(cx - 3), int(cy - 1), int(cx), int(cy + 3))
+            p.drawLine(int(cx), int(cy + 3), int(cx + 3), int(cy - 1))
+        else:
+            p.drawLine(int(cx - 3), int(cy - 3), int(cx + 1), int(cy))
+            p.drawLine(int(cx + 1), int(cy), int(cx - 3), int(cy + 3))
+        p.end()
+
+
+class SubRow(QWidget):
+    """二级分类：文档 -> Excel / Word …，再点一下展开出文件列表。"""
+
+    def __init__(self, pal, name, path, count):
+        super(SubRow, self).__init__()
+        self.pal = pal
+        self.name = name
+        self.path = path
+        self.expanded = False
+        self._filled = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.head = SubHeader(pal, name, count)
+        self.head.toggled.connect(self.toggle)
+        lay.addWidget(self.head)
+
+        self.body = QWidget()
+        self.body.setVisible(False)
+        self.bl = QVBoxLayout(self.body)
+        self.bl.setContentsMargins(26, 0, 6, 3)
+        self.bl.setSpacing(0)
+        lay.addWidget(self.body)
+
+    def toggle(self):
+        if not self._filled:
+            self._fill()
+            self._filled = True
+        self.expanded = not self.expanded
+        self.head.expanded = self.expanded
+        self.head.update()
+        self.body.setVisible(self.expanded)
+
+    def _fill(self):
+        rows = []
+        for dirpath, dirnames, filenames in os.walk(self.path):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for f in filenames:
+                if f.startswith(".") or f.startswith("~$"):
+                    continue
+                rows.append((f, os.path.join(dirpath, f)))
+        rows.sort(key=lambda r: r[0].lower())
+
+        for name, path in rows[:60]:
+            self.bl.addWidget(FileRow(self.pal, name, path))
+        if len(rows) > 60:
+            more = QLabel("…… 还有 %d 个" % (len(rows) - 60))
+            more.setStyleSheet("color:%s;font-size:10.5px;padding-left:20px;"
+                               % self.pal.muted.name())
+            self.bl.addWidget(more)
+        if not rows:
+            empty = QLabel("空")
+            empty.setStyleSheet("color:%s;font-size:10.5px;padding-left:20px;"
+                                % self.pal.muted.name())
+            self.bl.addWidget(empty)
+
+
 class CatHeader(QWidget):
     toggled = pyqtSignal()
 
@@ -631,7 +771,7 @@ class CatRow(QWidget):
         elif self.cat == rules.FOLDER:
             self._fill_folders()
         else:
-            self._fill_files()
+            self._fill_tree()
 
     def _fill_folders(self):
         """文件夹分类：每一项本来就是文件夹，点开等于进目录，不用钻。"""
@@ -645,33 +785,38 @@ class CatRow(QWidget):
         if not self.items:
             self._empty()
 
-    def _fill_files(self):
-        """其他分类：钻到子分类目录底下，直接平铺文件名。
+    def _fill_tree(self):
+        """一级展开：有二级分类就列二级（各自还能再展开），没有就直接列文件。
 
-        以前展开「文档」只看到 Word/ Excel/ PDF/ 几个子文件夹，还得再点
-        一层才见到文件。现在一次列全，点名字就用默认程序打开；子分类名
-        缩成右侧灰字，信息不丢但不占地方。
+        「文档」底下列 Word/Excel/PPT/PDF/文本，点开二级才见文件；
+        「图片」这类没有二级的，展开就是文件本身。两级都是折叠菜单。
         """
-        rows = []
+        subs, loose = [], []
         for name, path, is_dir, count in self.items:
-            if not is_dir:
-                rows.append((name, path, ""))
-                continue
-            tag = name.rstrip("/")
-            for dirpath, dirnames, filenames in os.walk(path):
-                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-                for f in filenames:
-                    if f.startswith(".") or f.startswith("~$"):
-                        continue
-                    rows.append((f, os.path.join(dirpath, f), tag))
-        rows.sort(key=lambda r: (r[0].lower(), r[2]))
+            if is_dir:
+                subs.append((name.rstrip("/"), path, count))
+            else:
+                loose.append((name, path))
 
+        if subs:
+            for name, path, count in subs:
+                self.bl.addWidget(SubRow(self.pal, name, path, count))
+            for name, path in loose:        # 分类根下散落的文件，排在二级后面
+                self.bl.addWidget(FileRow(self.pal, name, path))
+        else:
+            self._fill_files(loose)
+        if not subs and not loose:
+            self._empty()
+
+    def _fill_files(self, rows):
+        """没有二级分类时：直接铺文件，点名字用默认程序打开。"""
+        rows = sorted(rows, key=lambda r: r[0].lower())
         shown = 0
-        for name, path, tag in rows:
+        for name, path in rows:
             if shown >= 80:
                 self._more(len(rows) - shown)
                 break
-            self.bl.addWidget(FileRow(self.pal, name, path, False, 0, tag=tag))
+            self.bl.addWidget(FileRow(self.pal, name, path))
             shown += 1
         if not rows:
             self._empty()
