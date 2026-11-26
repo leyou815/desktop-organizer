@@ -299,6 +299,60 @@ class AppTile(QWidget):
         p.end()
 
 
+class TabButton(QWidget):
+    """竖排 tab 按钮：文字一个字一行，选中态主题色底白字。"""
+
+    def __init__(self, pal, text, on_click):
+        super(TabButton, self).__init__()
+        self.pal = pal
+        self._label = text
+        self.on_click = on_click
+        self.active = False
+        self._hover = False
+        self.setFixedSize(44, 62)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.on_click:
+            self.on_click()
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+        if self.active:
+            p.setPen(Qt.NoPen)
+            p.setBrush(self.pal.accent)
+            p.drawRoundedRect(r, 8, 8)
+            fg = QColor("#FFFFFF")
+        elif self._hover:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(self.pal.card_hi.name()))
+            p.drawRoundedRect(r, 8, 8)
+            fg = self.pal.text
+        else:
+            fg = self.pal.muted
+        f = self.font()
+        f.setPointSizeF(10.5)
+        f.setBold(self.active)
+        p.setFont(f)
+        p.setPen(QPen(fg))
+        # 逐字竖排：每个字单独一行
+        y = 6
+        for ch in self._label:
+            p.drawText(QRectF(0, y, self.width(), 20), Qt.AlignHCenter | Qt.AlignVCenter, ch)
+            y += 20
+        p.end()
+
+
 _ICON_CACHE = {}
 _NAME_CACHE = {}
 
@@ -677,14 +731,40 @@ class Panel(QWidget):
         self._fade.setDuration(200)
 
         self._build()
+        self.search_box.setVisible(False)   # 默认应用页，搜索只在文件页
         self.refresh()
 
     # -- 结构 ---------------------------------------------------------------
     def _build(self):
         pal = self.pal
-        lay = QVBoxLayout(self)
+        # 外层：左侧竖排 tab 条 + 右侧内容区
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        tabbar = QFrame()
+        tabbar.setFixedWidth(52)
+        tabbar.setStyleSheet(
+            "QFrame{background:%s;border-right:1px solid %s;}"
+            % (pal.card.name(), pal.line.name()))
+        tbl = QVBoxLayout(tabbar)
+        tbl.setContentsMargins(4, 14, 4, 8)
+        tbl.setSpacing(6)
+        self.tab = "apps"          # 当前页：apps / files
+        self.tab_btns = {}
+        for key, label in (("apps", "应用"), ("files", "文件")):
+            b = TabButton(pal, label, lambda k=key: self._switch_tab(k))
+            self.tab_btns[key] = b
+            tbl.addWidget(b)
+        tbl.addStretch(1)
+        root.addWidget(tabbar)
+
+        content = QWidget()
+        lay = QVBoxLayout(content)
         lay.setContentsMargins(16, 14, 14, 14)
         lay.setSpacing(8)
+        root.addWidget(content, 1)
+        self._style_tabs()
 
         head = QHBoxLayout()
         head.setSpacing(8)
@@ -704,7 +784,7 @@ class Panel(QWidget):
         head.addWidget(self._mini_btn("✕", self.slide_out))
         lay.addLayout(head)
 
-        # 搜索框
+        # 搜索框（只在文件页显示）
         self._query = ""
         self._rows = []
         self._sel = -1
@@ -720,12 +800,19 @@ class Panel(QWidget):
         self.search.addAction(QIcon.fromTheme("edit-find"), QLineEdit.LeadingPosition)
         self.search.textChanged.connect(self._queue_search)
         self.search.installEventFilter(self)
-        lay.addWidget(self.search)
 
         self.hint = QLabel("")
         self.hint.setStyleSheet("color:%s;font-size:10px;padding-left:4px;" % pal.muted.name())
         self.hint.setVisible(False)
-        lay.addWidget(self.hint)
+
+        # 搜索区（只在文件页显示）
+        self.search_box = QWidget()
+        sl = QVBoxLayout(self.search_box)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(6)
+        sl.addWidget(self.search)
+        sl.addWidget(self.hint)
+        lay.addWidget(self.search_box)
 
         # 勾选后浮出来的操作条
         self.opsbar = QFrame()
@@ -833,6 +920,67 @@ class Panel(QWidget):
         self.btn_undo = self._mini_btn("撤销上次", self.undo)
         foot.addWidget(self.btn_undo)
         lay.addLayout(foot)
+
+    def _style_tabs(self):
+        """竖排 tab 的选中态交给 TabButton 自绘。"""
+        for key, b in self.tab_btns.items():
+            b.active = key == self.tab
+            b.update()
+
+    def _switch_tab(self, key):
+        if key == self.tab:
+            return
+        self.tab = key
+        self._style_tabs()
+        # 搜索只在文件页用：切到应用页时清掉查询，免得搜索结果盖住图标
+        if key == "apps":
+            self._query = ""
+            self.search.clear()
+        self.search_box.setVisible(key == "files")
+        self.scroll.verticalScrollBar().setValue(0)
+        self.refresh()
+
+    def _fill_app_page(self, items):
+        """应用页：所有图标直接铺开（含系统虚拟图标），单击即启动。"""
+        pal = self.pal
+        entries = []
+        for name, path, is_dir, count in items:
+            lc = launchers.parse(path)
+            entries.append((lc.name, load_icon(lc.icon, path), path,
+                            lambda p=path: self._launch_app(p), path))
+        try:
+            if launchers.virtual_hidden():       # 系统图标藏了才在抽屉里补位
+                for vname, uri, theme in launchers.VIRTUAL:
+                    entries.append((vname, virtual_icon(vname, theme), uri,
+                                    lambda u=uri: launchers.open_uri(u), uri))
+        except Exception:
+            pass
+
+        if not entries:
+            tip = QLabel("还没有已归档的应用")
+            tip.setStyleSheet("color:%s;font-size:12px;padding:18px 6px;" % pal.muted.name())
+            self.bl.addWidget(tip)
+            return
+
+        head = QLabel("应用 · %d 项" % len(entries))
+        head.setStyleSheet("color:%s;font-size:11px;font-weight:600;padding:2px 4px 6px;"
+                           % pal.muted.name())
+        self.bl.addWidget(head)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 4)
+        grid.setHorizontalSpacing(2)
+        grid.setVerticalSpacing(2)
+        for i, (name, icon, path, slot, tiptext) in enumerate(entries):
+            grid.addWidget(AppTile(pal, name, icon, slot, tiptext), i // 4, i % 4)
+        wrap = QWidget()
+        wrap.setLayout(grid)
+        self.bl.addWidget(wrap)
+
+    def _launch_app(self, path):
+        ok, err = launchers.launch(path)
+        if not ok:
+            self._flash("启动失败：%s" % err)
 
     def _mini_btn(self, text, slot):
         b = QPushButton(text)
@@ -1155,10 +1303,16 @@ class Panel(QWidget):
         self._rows = []
         self.opsbar.setVisible(False)
         self._clear_body()
-        for cat in rules.CATEGORY_ORDER:
-            row = CatRow(self.pal, cat, rules.CATEGORY_DESC.get(cat, ""),
-                         data.get(cat, []), cfg=self.cfg)
-            self.bl.addWidget(row)
+        if self.tab == "apps":
+            self._fill_app_page(data.get(rules.APP, []))
+        else:
+            # 文件页不再重复显示应用分类（应用已在应用页铺开）
+            for cat in rules.CATEGORY_ORDER:
+                if cat == rules.APP:
+                    continue
+                row = CatRow(self.pal, cat, rules.CATEGORY_DESC.get(cat, ""),
+                             data.get(cat, []), cfg=self.cfg)
+                self.bl.addWidget(row)
         self.bl.addStretch(1)
         self._update_undo_btn()
 
