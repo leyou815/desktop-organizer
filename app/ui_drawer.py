@@ -18,7 +18,7 @@ from PyQt5.QtGui import (QColor, QPainter, QPainterPath, QLinearGradient, QPen,
                          QBrush, QFontMetrics, QIcon, QDesktopServices)
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QVBoxLayout,
                              QHBoxLayout, QScrollArea, QFrame, QGridLayout, QLineEdit,
-                             QFileIconProvider, QStyle, QDialog)
+                             QFileIconProvider, QStyle, QDialog, QSizePolicy)
 
 import atomicio
 import bulkops
@@ -246,12 +246,12 @@ class AppTile(QWidget):
 
     W, H = 82, 86
 
-    def __init__(self, pal, name, icon, on_click, tooltip=""):
+    def __init__(self, pal, name, icon, on_click, tooltip="", width=None):
         super(AppTile, self).__init__()
         self.pal = pal
         self.name = name
         self.on_click = on_click
-        self.setFixedSize(self.W, self.H)
+        self.setFixedSize(width or self.W, self.H)
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip(tooltip or name)
         self._hover = False
@@ -296,9 +296,20 @@ class AppTile(QWidget):
         p.end()
 
 
+def tile_grid(avail, gap=6):
+    """按可用宽度算图标网格的（列数, 每格宽度）。
+
+    抽屉固定 386px，4 列要 334px，而内容区只有 ~300px，第 4 列会被
+    窗口右边缘切掉。这里按实际可用宽度反算，多出来的横向余量摊给
+    每格，所以不会溢出，也不会在右侧空出一道。
+    """
+    cols = max(2, min(5, int((avail + gap) // (AppTile.W + gap))))
+    width = max(AppTile.W, (avail - (cols - 1) * gap) // cols)
+    return cols, width
+
+
 class TabButton(QWidget):
     """竖排 tab 按钮：文字一个字一行，选中态主题色底白字。"""
-
     def __init__(self, pal, text, on_click):
         super(TabButton, self).__init__()
         self.pal = pal
@@ -558,11 +569,14 @@ class CatHeader(QWidget):
         # 数量 + 说明（等宽标签，对应 NODE / ORIGIN / FLOW）
         p.setFont(self.pal.font_mono(10))
         p.setPen(QPen(col))
-        p.drawText(QRectF(52, 27, 46, 16), Qt.AlignVCenter | Qt.AlignLeft,
+        # 两位数字只要 26px，别让它占到 46px 把说明挤窄
+        p.drawText(QRectF(52, 27, 26, 16), Qt.AlignVCenter | Qt.AlignLeft,
                    "%02d" % self.count)
         p.setPen(QPen(self.pal.muted))
-        p.drawText(QRectF(100, 27, w - 145, 16), Qt.AlignVCenter | Qt.AlignLeft,
-                   self.desc)
+        # 说明原文最长 290px，直接画会被硬切一半，用省略号收尾
+        desc = p.fontMetrics().elidedText(self.desc, Qt.ElideRight, int(w - 114))
+        p.drawText(QRectF(82, 27, w - 114, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                   desc)
 
         # 展开箭头
         p.setPen(QPen(self.pal.muted, 1.6))
@@ -669,10 +683,13 @@ class CatRow(QWidget):
 
         grid = QGridLayout()
         grid.setContentsMargins(0, 2, 0, 4)
-        grid.setHorizontalSpacing(2)
-        grid.setVerticalSpacing(2)
+        grid.setHorizontalSpacing(Panel.GAP_X)
+        grid.setVerticalSpacing(6)
+        # 减掉 body 的左右缩进（14+12）和滚动条让位，避免又顶到右边缘
+        cols, tile_w = tile_grid(Panel.WIDTH - Panel.CHROME_W - 34)
         for i, (name, icon, path, slot) in enumerate(entries):
-            grid.addWidget(AppTile(self.pal, name, icon, slot, path), i // 4, i % 4)
+            grid.addWidget(AppTile(self.pal, name, icon, slot, path, width=tile_w),
+                           i // cols, i % cols)
         wrap = QWidget()
         wrap.setLayout(grid)
         self.bl.addWidget(wrap)
@@ -812,10 +829,10 @@ class Panel(QWidget):
         self._style_tabs()
 
         head = QHBoxLayout()
-        head.setSpacing(10)
+        head.setSpacing(8)
         # 大号 01 编号（壁纸 hero）
         no = QLabel("01")
-        no.setFont(pal.font_display(30))
+        no.setFont(pal.font_display(27))
         no.setStyleSheet("color:%s;" % pal.accent.name())
         head.addWidget(no)
         # 竖线分隔
@@ -831,14 +848,20 @@ class Panel(QWidget):
         self.sub = QLabel("")
         self.sub.setFont(pal.font_mono(10))
         self.sub.setStyleSheet("color:%s;" % pal.muted.name())
+        # Minimum 策略：头一行本来就窄，默认策略会把这段压到裁字
+        self.sub.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
         title_box.addWidget(t)
         title_box.addWidget(self.sub)
         head.addLayout(title_box)
         head.addStretch(1)
 
-        self.btn_open = self._mini_btn("打开目录", self._open_root)
+        # 这里只有 ~274px，四个元素平分不过来：长按钮会把右边的字挤掉
+        self.btn_open = self._mini_btn("目录", self._open_root)
+        self.btn_open.setToolTip("打开归档目录")
         head.addWidget(self.btn_open)
-        head.addWidget(self._mini_btn("✕", self.slide_out))
+        self.btn_close = self._mini_btn("✕", self.slide_out)
+        self.btn_close.setToolTip("收起（Esc）")
+        head.addWidget(self.btn_close)
         lay.addLayout(head)
 
         # 搜索框（只在文件页显示）
@@ -1028,13 +1051,24 @@ class Panel(QWidget):
 
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 4)
-        grid.setHorizontalSpacing(2)
-        grid.setVerticalSpacing(2)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(8)
+        cols, tile_w = self._app_grid()
         for i, (name, icon, path, slot, tiptext) in enumerate(entries):
-            grid.addWidget(AppTile(pal, name, icon, slot, tiptext), i // 4, i % 4)
+            grid.addWidget(AppTile(pal, name, icon, slot, tiptext, width=tile_w),
+                           i // cols, i % cols)
         wrap = QWidget()
         wrap.setLayout(grid)
         self.bl.addWidget(wrap)
+
+    # 386px 的面板里 4 列要 334px，而内容区只有 ~300px，第 4 列会被
+    # 窗口边缘切掉。改成按可用宽度算列数，并把余量摊到每格宽度上，
+    # 这样以后调面板宽度也不会溢出，也不会在右侧留一道空。
+    CHROME_W = 52 + 16 + 14 + 4      # tab 条 + 内容左右边距 + 滚动区右留白
+    GAP_X = 6
+
+    def _app_grid(self):
+        return tile_grid(self.WIDTH - self.CHROME_W, self.GAP_X)
 
     def _launch_app(self, path):
         ok, err = launchers.launch(path)
@@ -1361,7 +1395,8 @@ class Panel(QWidget):
     def refresh(self):
         data = self.org.summary()
         total = sum(rules.count_items(c, data[c]) for c in data)
-        self.sub.setText("ARCHIVED  %d  ITEMS" % total)
+        # 头部横向只有 ~274px，加上 ITEMS 会顶开右边的按钮，所以只留数字
+        self.sub.setText("ARCHIVED  %d" % total)
         self.path_hint.setText("归档位置：%s"
                                % self.org.root.replace(os.path.expanduser("~"), "~"))
 
