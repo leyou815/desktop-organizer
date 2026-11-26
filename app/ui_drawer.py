@@ -329,23 +329,23 @@ class TabButton(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(self.rect()).adjusted(2, 2, -2, -2)
         if self.active:
+            # 选中态：青→紫渐变，对应壁纸 01 的双色
+            grad = QLinearGradient(r.left(), r.top(), r.left(), r.bottom())
+            grad.setColorAt(0, self.pal.accent)
+            grad.setColorAt(1, self.pal.accent_2)
             p.setPen(Qt.NoPen)
-            p.setBrush(self.pal.accent)
+            p.setBrush(grad)
             p.drawRoundedRect(r, 8, 8)
             fg = QColor("#FFFFFF")
         elif self._hover:
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(self.pal.card_hi.name()))
+            p.setBrush(self.pal.card_hi)
             p.drawRoundedRect(r, 8, 8)
             fg = self.pal.text
         else:
             fg = self.pal.muted
-        f = self.font()
-        f.setPointSizeF(10.5)
-        f.setBold(self.active)
-        p.setFont(f)
+        p.setFont(self.pal.font_ui(12, bold=self.active))
         p.setPen(QPen(fg))
-        # 逐字竖排：每个字单独一行
         y = 6
         for ch in self._label:
             p.drawText(QRectF(0, y, self.width(), 20), Qt.AlignHCenter | Qt.AlignVCenter, ch)
@@ -544,28 +544,28 @@ class CatHeader(QWidget):
             p.setBrush(QColor(255, 255, 255, 18) if self.pal.dark else QColor(0, 0, 0, 12))
             p.drawRoundedRect(QRectF(self.rect()).adjusted(2, 2, -2, -2), 8, 8)
 
-        # 颜色块
+        # 蓝图节点方块：描边 + 内点，对应壁纸折线的连接点
         col = QColor(CAT_COLORS.get(self.cat, "#8A8F98"))
+        p.setPen(QPen(col, 1.4))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(10, 10, 30, 30), 7, 7)
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(col.red(), col.green(), col.blue(), 48))
-        p.drawRoundedRect(QRectF(10, 9, 32, 32), 9, 9)
         p.setBrush(col)
-        p.drawRoundedRect(QRectF(19, 18, 14, 14), 4, 4)
+        p.drawEllipse(QRectF(20, 20, 10, 10))
 
-        # 标题 + 数量
+        # 标题（UI 字体）
+        p.setFont(self.pal.font_ui(13, bold=True))
         p.setPen(QPen(self.pal.text))
-        f = self.font()
-        f.setPointSizeF(f.pointSizeF() + 0.5)
-        f.setBold(True)
-        p.setFont(f)
-        p.drawText(QRectF(52, 8, w - 90, 20), Qt.AlignVCenter | Qt.AlignLeft, self.cat)
+        p.drawText(QRectF(52, 7, w - 100, 21), Qt.AlignVCenter | Qt.AlignLeft, self.cat)
 
-        f2 = self.font()
-        f2.setPointSizeF(f2.pointSizeF() - 1.5)
-        p.setFont(f2)
+        # 数量 + 说明（等宽标签，对应 NODE / ORIGIN / FLOW）
+        p.setFont(self.pal.font_mono(10))
+        p.setPen(QPen(col))
+        p.drawText(QRectF(52, 27, 46, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                   "%02d" % self.count)
         p.setPen(QPen(self.pal.muted))
-        p.drawText(QRectF(52, 26, w - 90, 16), Qt.AlignVCenter | Qt.AlignLeft,
-                   "%d 个 · %s" % (self.count, self.desc))
+        p.drawText(QRectF(100, 27, w - 145, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                   self.desc)
 
         # 展开箭头
         p.setPen(QPen(self.pal.muted, 1.6))
@@ -767,13 +767,25 @@ class Panel(QWidget):
         self._style_tabs()
 
         head = QHBoxLayout()
-        head.setSpacing(8)
+        head.setSpacing(10)
+        # 大号 01 编号（壁纸 hero）
+        no = QLabel("01")
+        no.setFont(pal.font_display(30))
+        no.setStyleSheet("color:%s;" % pal.accent.name())
+        head.addWidget(no)
+        # 竖线分隔
+        sep = QFrame()
+        sep.setFixedSize(1, 34)
+        sep.setStyleSheet("background:%s;" % pal.line.name())
+        head.addWidget(sep)
         title_box = QVBoxLayout()
         title_box.setSpacing(1)
         t = QLabel("桌面抽屉")
-        t.setStyleSheet("color:%s;font-size:15px;font-weight:700;" % pal.text.name())
+        t.setFont(pal.font_ui(15, bold=True))
+        t.setStyleSheet("color:%s;" % pal.text.name())
         self.sub = QLabel("")
-        self.sub.setStyleSheet("color:%s;font-size:11px;" % pal.muted.name())
+        self.sub.setFont(pal.font_mono(10))
+        self.sub.setStyleSheet("color:%s;" % pal.muted.name())
         title_box.addWidget(t)
         title_box.addWidget(self.sub)
         head.addLayout(title_box)
@@ -789,14 +801,16 @@ class Panel(QWidget):
         self._rows = []
         self._sel = -1
         self.search = QLineEdit()
-        self.search.setPlaceholderText("搜索文件名，或拼音首字母：wx / sls / 报告")
+        self.search.setFont(pal.font_ui(12))
+        self.search.setPlaceholderText("搜索 / SEARCH  ·  wx / sls / 报告")
         self.search.setClearButtonEnabled(True)
-        self.search.setFixedHeight(32)
+        self.search.setFixedHeight(34)
         self.search.setStyleSheet("""
-        QLineEdit{border:1px solid %s;border-radius:8px;background:%s;
+        QLineEdit{border:1px solid %s;border-radius:9px;background:%s;
             color:%s;font-size:12px;padding-left:10px;padding-right:6px;}
-        QLineEdit:focus{border:1px solid %s;}
-        """ % (pal.line.name(), pal.card_hi.name(), pal.text.name(), pal.accent.name()))
+        QLineEdit:focus{border:1px solid %s;background:%s;}
+        """ % (pal.line.name(), pal.card_hi.name(), pal.text.name(),
+               pal.accent.name(), pal.card.name()))
         self.search.addAction(QIcon.fromTheme("edit-find"), QLineEdit.LeadingPosition)
         self.search.textChanged.connect(self._queue_search)
         self.search.installEventFilter(self)
@@ -962,9 +976,9 @@ class Panel(QWidget):
             self.bl.addWidget(tip)
             return
 
-        head = QLabel("应用 · %d 项" % len(entries))
-        head.setStyleSheet("color:%s;font-size:11px;font-weight:600;padding:2px 4px 6px;"
-                           % pal.muted.name())
+        head = QLabel("APPLICATIONS  /  %02d" % len(entries))
+        head.setFont(pal.font_mono(10))
+        head.setStyleSheet("color:%s;padding:2px 4px 7px;" % pal.accent.name())
         self.bl.addWidget(head)
 
         grid = QGridLayout()
@@ -1022,15 +1036,31 @@ class Panel(QWidget):
         # 只圆左边两个角：向右多画 32px，右侧圆角落到窗口外被裁掉
         path.addRoundedRect(QRectF(-16, 0, w + 32, h), 16, 16)
         p.fillPath(path, QBrush(self.pal.card))
-        # 左边一条细高光
-        grad = QLinearGradient(0, 0, 3, 0)
-        grad.setColorAt(0, QColor(self.pal.accent.red(), self.pal.accent.green(),
-                                  self.pal.accent.blue(), 150))
-        grad.setColorAt(1, QColor(self.pal.accent.red(), self.pal.accent.green(),
-                                  self.pal.accent.blue(), 0))
+
+        # 蓝图网格：壁纸同款细网格，仅在内容区（跳过左侧 52px tab 条）
+        p.save()
+        p.clipPath(path)
+        gp = self.pal.grid
+        p.setPen(QPen(gp, 1))
+        step = 28
+        for x in range(52, w, step):
+            p.drawLine(x, 0, x, h)
+        for y in range(0, h, step):
+            p.drawLine(52, y, w, y)
+        p.restore()
+
+        # 青→紫渐变脊线（唯一记忆点：对应壁纸大 01 的颜色过渡）
+        grad = QLinearGradient(0, 20, 0, h - 20)
+        grad.setColorAt(0, self.pal.accent)
+        grad.setColorAt(1, self.pal.accent_2)
         p.setPen(Qt.NoPen)
         p.setBrush(QBrush(grad))
-        p.drawRect(QRectF(0, 18, 3, h - 36))
+        p.drawRect(QRectF(0, 16, 3, h - 32))
+        # 脊线上两个节点，对应壁纸折线的连接点
+        for cy in (18, h - 18):
+            p.setBrush(self.pal.card)
+            p.setPen(QPen(self.pal.accent if cy < h / 2 else self.pal.accent_2, 2))
+            p.drawEllipse(QRectF(0, cy - 4, 8, 8))
         p.end()
 
     # -- 搜索 ---------------------------------------------------------------
@@ -1283,7 +1313,7 @@ class Panel(QWidget):
     def refresh(self):
         data = self.org.summary()
         total = sum(rules.count_items(c, data[c]) for c in data)
-        self.sub.setText("共归档 %d 项" % total)
+        self.sub.setText("ARCHIVED  %d  ITEMS" % total)
         self.path_hint.setText("归档位置：%s"
                                % self.org.root.replace(os.path.expanduser("~"), "~"))
 
