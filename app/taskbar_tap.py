@@ -63,17 +63,25 @@ class TapError(RuntimeError):
 # DLL 从哪来
 # --------------------------------------------------------------------------- #
 def _candidates():
-    """按优先级列出 do_inject.dll 的可能位置，兼容「源码目录」「安装目录」「打包 exe」。"""
-    here = os.path.dirname(os.path.abspath(__file__))        # …/app
-    root = os.path.dirname(here)                             # …/DesktopOrganizer
+    """按优先级列出 do_inject.dll 的可能位置，兼容「源码目录」「安装目录」「打包 exe」。
+
+    打包（PyInstaller --onefile）有个坑：模块会被**平铺解压**到临时目录根部，
+    本文件的 __file__ 是 `_MEIxxxx\taskbar_tap.py`（不在 app\ 子目录里），
+    所以不能只靠 __file__ 往上推 —— 必须直接用 sys._MEIPASS 拼 tap\。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))        # 源码=…/app；打包=_MEIxxxx
+    root = os.path.dirname(here)                             # 源码=仓库根；打包=Temp（无用）
     out = []
     env = os.environ.get("DESKTOP_ORGANIZER_TAP_DLL")
     if env:
         out.append(env)
+    mei = getattr(sys, "_MEIPASS", None)
+    if mei:
+        out.append(os.path.join(mei, "tap", "do_inject.dll"))
     if getattr(sys, "frozen", False):
-        # PyInstaller：DLL 跟着 exe 走，放 exe 同级的 tap\ 下
         out.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
                                 "tap", "do_inject.dll"))
+    out.append(os.path.join(here, "tap", "do_inject.dll"))
     out.append(os.path.join(root, "tap", "do_inject.dll"))
     out.append(os.path.join(root, "inject", "target", "release", "do_inject.dll"))
     out.append(os.path.join(os.path.dirname(root), "inject", "target", "release",
@@ -81,11 +89,42 @@ def _candidates():
     return out
 
 
+_DID_LOG = False
+
+
+def _write_diag(found):
+    """把候选路径写进 tap.log（只写一次/进程）。
+
+    "为什么界面里没有「任务栏完全透明」那一行" 只有一个原因：找不到组件。
+    打包成 exe 后路径规则变了（PyInstaller 会解到临时目录），用户没法自己查，
+    所以这行日志是留给排查用的，别删。
+    """
+    global _DID_LOG
+    if _DID_LOG:
+        return
+    _DID_LOG = True
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        lines = ["[%s] 平台=%s frozen=%s" % (time.strftime("%H:%M:%S"), sys.platform,
+                                             bool(getattr(sys, "frozen", False))),
+                 "  本文件=%s" % os.path.abspath(__file__),
+                 "  exe=%s" % sys.executable,
+                 "  选用=%s" % (found or "（没有找到）")]
+        for p in _candidates():
+            lines.append("  %s  %s" % ("OK  " if os.path.isfile(p) else "miss", p))
+        with open(os.path.join(STATE_DIR, "tap.log"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
 def dll_source():
     """找到可用的 do_inject.dll；找不到返回 None（界面上显示为"本机没有注入组件"）。"""
     for p in _candidates():
         if os.path.isfile(p):
+            _write_diag(p)
             return p
+    _write_diag(None)
     return None
 
 
