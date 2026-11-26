@@ -33,10 +33,52 @@ def start_menu():
                         "Microsoft", "Windows", "Start Menu", "Programs")
 
 
-def pythonw():
-    exe = sys.executable or "python"
+def pythonw(exe=None):
+    """取同目录的 pythonw.exe（无控制台窗口）。exe 为空时用当前解释器。"""
+    exe = exe or sys.executable or "python"
     cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
     return cand if os.path.isfile(cand) else exe
+
+
+def _is_private_python(exe):
+    """判断是不是「某个工具自带的」Python。
+
+    WorkBuddy／绿色版工具的内置解释器长这样：
+        C:\\Users\\X\\.workbuddy\\binaries\\python\\versions\\3.13.12\\python.exe
+    这类路径会随工具升级换版本号（3.13.12 → 3.13.15），写进快捷方式后一旦升级
+    就变成死链 —— 双击没反应，用户完全查不出原因。所以装的时候要主动绕开。
+    """
+    p = os.path.normcase(os.path.abspath(exe))
+    return os.sep + ".workbuddy" + os.sep in p
+
+
+def pick_interpreter():
+    """挑一个「属于用户自己」的解释器：优先当前解释器，不行再从系统里找一个。
+
+    只在当前解释器是工具私有的情况下才换。换之前必须实际验证目标能 import PyQt5，
+    否则会把能用的换成不能用的。
+    """
+    cur = sys.executable or "python"
+    if not _is_private_python(cur):
+        return cur
+    print("    当前解释器是工具内置的（%s）" % cur)
+    print("    它在工具升级后会换路径，不适合写进快捷方式，改找系统里的 Python…")
+    for probe in (["py", "-3"], ["python"]):
+        try:
+            r = subprocess.run(probe + ["-c",
+                                        "import sys, PyQt5.QtCore; print(sys.executable)"],
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                continue
+            found = (r.stdout or "").strip().splitlines()[-1].strip()
+            if (found and os.path.isfile(found)
+                    and not _is_private_python(found)):
+                print("    改用 %s" % found)
+                return found
+        except Exception:
+            continue
+    print("    没找到可用的独立 Python，仍用当前解释器（工具升级后可能需要重新安装）")
+    return cur
 
 
 def check_env():
@@ -103,7 +145,7 @@ def _ps_quote(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
-def make_shortcut(dst):
+def make_shortcut(dst, interp=None):
     lnk = os.path.join(start_menu(), APP_NAME + ".lnk")
     entry = os.path.join(dst, "app", "cli.py")
     icon = os.path.join(dst, "assets", "icon.ico")
@@ -117,7 +159,7 @@ def make_shortcut(dst):
         "$s.WindowStyle = 7;"
         "$s.Description = %s;"
         "$s.Save()"
-    ) % (_ps_quote(lnk), _ps_quote(pythonw()),
+    ) % (_ps_quote(lnk), _ps_quote(pythonw(interp)),
          _ps_quote('"%s" run' % entry), _ps_quote(dst),
          ("$s.IconLocation = %s;" % _ps_quote(icon)) if os.path.isfile(icon) else "",
          _ps_quote(APP_NAME))
@@ -137,12 +179,13 @@ def make_shortcut(dst):
         return False
 
 
-def set_autostart(dst, on):
+def set_autostart(dst, on, interp=None):
     import winreg
     key = r"Software\Microsoft\Windows\CurrentVersion\Run"
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_SET_VALUE) as k:
         if on:
-            cmd = '"%s" "%s" run' % (pythonw(), os.path.join(dst, "app", "cli.py"))
+            cmd = '"%s" "%s" run' % (pythonw(interp),
+                                     os.path.join(dst, "app", "cli.py"))
             winreg.SetValueEx(k, FOLDER, 0, winreg.REG_SZ, cmd)
         else:
             try:
@@ -169,13 +212,16 @@ def main():
     except Exception as e:
         print("        安装中止：%s" % e)
         return 1
-    make_shortcut(dst)
+
+    print("==> 选择解释器")
+    interp = pick_interpreter()
+    make_shortcut(dst, interp)
 
     print("==> 开机自启")
     ans = input("    登录后自动常驻托盘？[Y/n] ").strip().lower()
     on = ans in ("", "y", "yes")
     try:
-        set_autostart(dst, on)
+        set_autostart(dst, on, interp)
         print("    已%s" % ("开启" if on else "关闭"))
     except Exception as e:
         print("    写入注册表失败：%s" % e)
