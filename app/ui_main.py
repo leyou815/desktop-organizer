@@ -453,8 +453,10 @@ class MainWindow(QWidget):
         box.addWidget(sub)
         head.addLayout(box)
         head.addStretch(1)
-        # 百分比只对麒麟的连续可调有意义；Windows 改成固定档位后不再显示数字
-        self.pct = QLabel("60%")
+        # 百分比只对麒麟的连续可调有意义；Windows 改成固定档位后不再显示数字。
+        # 注意要挂到 page 名下：Qt 里没父对象又不进布局的控件会变成独立
+        # 顶层窗口浮在桌面上（「弹出一堆小窗」就是这个原因）。
+        self.pct = QLabel("60%", page)
         self.pct.setFont(pal.font_display(26))
         self.pct.setStyleSheet("color:%s;" % pal.accent.name())
         if not sysenv.IS_WINDOWS:
@@ -506,7 +508,7 @@ class MainWindow(QWidget):
             lay.addWidget(self.style_help)
 
         # 注入全透明（Windows 独有，v1.0.6+）：真把任务栏背景摘掉，图标不受影响
-        self.inject_row = QWidget()
+        self.inject_row = QWidget(page)
         self.inject_row.setStyleSheet("background:transparent;")
         r1 = QHBoxLayout(self.inject_row)
         r1.setContentsMargins(0, 0, 0, 0)
@@ -531,7 +533,7 @@ class MainWindow(QWidget):
 
         # 只在注入模式显示：这一行回答"生效了吗"和"怎么彻底卸掉"两个必然会问的问题
         self.inject_note = QLabel("已生效：任务栏背景交给壁纸，图标原样。资源管理器重启后会自动重连；"
-                                  "想彻底卸掉这份组件，重启一次资源管理器即可。")
+                                  "想彻底卸掉这份组件，重启一次资源管理器即可。", page)
         self.inject_note.setWordWrap(True)
         self.inject_note.setStyleSheet("color:%s;font-size:10.5px;" % pal.muted.name())
         self.inject_note.setVisible(False)
@@ -539,7 +541,7 @@ class MainWindow(QWidget):
             lay.addWidget(self.inject_note)
 
         # 自动隐藏（Windows 独有）：这是外部程序唯一能做到"图标零损失"的办法
-        self.autohide_row = QWidget()
+        self.autohide_row = QWidget(page)
         self.autohide_row.setStyleSheet("background:transparent;")
         r0 = QHBoxLayout(self.autohide_row)
         r0.setContentsMargins(0, 0, 0, 0)
@@ -561,7 +563,7 @@ class MainWindow(QWidget):
         self.autohide_row.setVisible(self.app.panel.supports_autohide())
 
         # 下面这一组是"整窗淡出"：自动隐藏开着时整组收起，两套机制不叠加
-        self.fade_box = QWidget()
+        self.fade_box = QWidget(page)
         self.fade_box.setStyleSheet("background:transparent;")
         fb = QVBoxLayout(self.fade_box)
         fb.setContentsMargins(0, 6, 0, 0)
@@ -604,7 +606,7 @@ class MainWindow(QWidget):
             lay.addWidget(self.fade_box)
 
         # 玻璃质感
-        self.glass_row = QWidget()
+        self.glass_row = QWidget(page)
         self.glass_row.setStyleSheet("background:transparent;")
         row1 = QHBoxLayout(self.glass_row)
         row1.setContentsMargins(0, 0, 0, 0)
@@ -628,7 +630,7 @@ class MainWindow(QWidget):
             lay.addWidget(self.glass_row)
 
         # 和第三方任务栏美化工具抢同一块任务栏，只能二选一
-        self.tools_hint = QLabel("")
+        self.tools_hint = QLabel("", page)
         self.tools_hint.setWordWrap(True)
         self.tools_hint.setFont(pal.font_mono(9.5))
         self.tools_hint.setStyleSheet("color:%s;" % pal.accent.name())
@@ -636,7 +638,7 @@ class MainWindow(QWidget):
         lay.addWidget(self.tools_hint)
 
         # 磨砂强度（Windows 只有系统 Acrylic 一档，整行不显示）
-        self.blur_row = QWidget()
+        self.blur_row = QWidget(page)
         self.blur_row.setStyleSheet("background:transparent;")
         row2 = QHBoxLayout(self.blur_row)
         row2.setContentsMargins(0, 0, 0, 0)
@@ -658,9 +660,13 @@ class MainWindow(QWidget):
         lay.addWidget(self.blur_row)
         lay.addSpacing(4)
         if sysenv.IS_WINDOWS:
-            # 各档差别已经由上面那张 style_help 讲清楚了，这里不再叠一张卡片：
-            # 两张说明挤在一起，用户反而两条都不看。
-            pass
+            # 档位制之后这些旧控件在 Windows 上不再进布局。上面已把它们挂到
+            # page 名下（防止变成顶层窗口乱飘），这里再统一隐藏——否则没进
+            # 布局的可见子控件会默认挤在页面 (0,0) 互相叠着。麒麟路径走
+            # addWidget，不受影响。
+            for w in (self.pct, self.inject_row, self.inject_note,
+                      self.autohide_row, self.fade_box, self.glass_row):
+                w.hide()
         else:
             lay.addWidget(self._hint_card(
                 "磨砂由系统合成器（ukui-kwin）渲染。任务栏没变化时先确认两件事："
@@ -1334,17 +1340,21 @@ class MainWindow(QWidget):
             self.sw_autohide.set_silent(auto)
         if hasattr(self, "sw_inject"):
             self.sw_inject.set_silent(inj)
-        if hasattr(self, "inject_note"):
-            self.inject_note.setVisible(inj)
-        if hasattr(self, "autohide_row"):
-            # 注入模式下另外两套都收起：同时出现只会让人以为能叠着用
-            self.autohide_row.setVisible(self.app.panel.supports_autohide() and not inj)
-        if hasattr(self, "fade_box"):
-            self.fade_box.setVisible(not auto and not inj)
-        if hasattr(self, "pct"):
-            self.pct.setVisible(not auto and not inj)
-        if hasattr(self, "glass_row"):
-            self.glass_row.setVisible(not inj)      # 玻璃质感对注入模式没意义
+        # 下面这批控件在 Windows 上已被「档位下拉」整体取代（见上方构建处的
+        # 隐藏逻辑）。它们不在布局里，一旦 setVisible(True) 就会全部叠在页面
+        # (0,0) 互相糊成一团——所以这些显隐切换只允许麒麟走，Windows 永远藏。
+        if not sysenv.IS_WINDOWS:
+            if hasattr(self, "inject_note"):
+                self.inject_note.setVisible(inj)
+            if hasattr(self, "autohide_row"):
+                # 注入模式下另外两套都收起：同时出现只会让人以为能叠着用
+                self.autohide_row.setVisible(self.app.panel.supports_autohide() and not inj)
+            if hasattr(self, "fade_box"):
+                self.fade_box.setVisible(not auto and not inj)
+            if hasattr(self, "pct"):
+                self.pct.setVisible(not auto and not inj)
+            if hasattr(self, "glass_row"):
+                self.glass_row.setVisible(not inj)      # 玻璃质感对注入模式没意义
         if hasattr(self, "tools_hint"):
             try:
                 tools = self.app.panel.running_taskbar_tools()
