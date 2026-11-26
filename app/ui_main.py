@@ -399,8 +399,10 @@ class MainWindow(QWidget):
         # 方向是"数值越大越深越实"，和麒麟的 gsettings 透明度不完全一样，
         # 所以提示文案按平台分开写，别让用户按错方向找半天。
         if sysenv.IS_WINDOWS:
-            sub_text = "数值越小越透（能透出壁纸），越大越实；最低 %d%% 保住轮廓" \
-                       % int(round(self.app.panel.min_alpha() * 100))
+            # 实测：Win11 任务栏背景由 explorer 的 XAML 层绘制，外部改不动；
+            # 只能整窗半透明，图标会跟着变淡。这句必须说清楚，否则用户会觉得"没调好"。
+            sub_text = ("拖低会透出桌面，但 Windows 只能整窗混合，图标与文字会一起变淡；"
+                        "最低 %d%% 保住可读性" % int(round(self.app.panel.min_alpha() * 100)))
         else:
             sub_text = "拉低就透出壁纸，磨砂质感始终保留"
         sub = QLabel(sub_text)

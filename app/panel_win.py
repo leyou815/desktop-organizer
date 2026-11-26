@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-桌面整理 —— Windows 任务栏毛玻璃后端
+桌面整理 —— Windows 任务栏后端
 
-Windows 没有"任务栏透明度"这个官方设置项。真正能让任务栏变成亚克力（Acrylic）
-的是未公开 API `user32!SetWindowCompositionAttribute`，配合
-`ACCENT_ENABLE_ACRYLICBLURBEHIND` 把一层带 alpha 的模糊贴到任务栏窗口上。
-TranslucentTB 这类工具走的就是这条路，不是改注册表。
+⚠️ 实测结论（Windows 11 10.0.26200 / 25H2，2026-11-26 复核）
+任务栏背景由 explorer 的 XAML 层自己绘制，外部进程改不动。以下全部实测无效，
+任务栏背景亮度波动 ≤2 级（等于纹丝不动）：
+  - SetWindowCompositionAttribute：AccentState 1/2/3/4/5 × alpha 0~255
+  - DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE = 2/3/4)：HRESULT=0 但无变化
+  - 注册表 TaskbarAcrylicOpacity：重启 explorer 后依然无变化
+  - 对 XAML 子窗口 DesktopWindowContentBridge 单独贴 accent
+TranslucentTB 能做到「背景透明 + 图标清晰」，是因为它注入 explorer 进程后在内部
+改渲染（Detour + SetWindowsHookEx），不是外部 API 调用；纯 Python 无法复刻。
+
+所以本后端在 Win11 上只提供一种真实可控的手段：
+  WS_EX_LAYERED + SetLayeredWindowAttributes —— 整窗不透明度。
+代价：图标与文字会跟着等比变淡，这是整窗合成的物理结果，不是 bug。
+
+Win10（build < 22000）上 AccentPolicy 的 alpha 仍然有效，走 accent 分支，
+可以做到「背景透、图标清晰」；Win11 才被迫退回整窗方案。
 
 流程：
-  1. 确保「设置 → 个性化 → 颜色 → 透明效果」是开的（注册表 EnableTransparency=1），
-     关掉的话任务栏是纯色，贴什么模糊都看不出来
-  2. FindWindow("Shell_TrayWnd") 拿到主任务栏，再枚举 Shell_SecondaryTrayWnd 拿副屏
-  3. 给每个任务栏窗口下发 ACCENT_POLICY：State=4(亚克力)、GradientColor=0xAABBGGRR
-  4. 资源管理器重启后窗口句柄会变，所以要定期复查句柄，变了就重新贴
-
-⚠️ 本文件在麒麟上无法实测，所有调用都有异常兜底；失败会返回明确错误而不是崩溃。
+  1. 确保「设置 → 个性化 → 颜色 → 透明效果」是开的（EnableTransparency=1）
+  2. FindWindow("Shell_TrayWnd") 拿主任务栏，再枚举 Shell_SecondaryTrayWnd 拿副屏
+  3. Win11：设 layered 不透明度；Win10：下发 ACCENT_POLICY 的 alpha
+  4. 资源管理器重启后窗口句柄会变，定期复查句柄，变了就重新贴
 """
 
 import ctypes
@@ -25,6 +34,9 @@ from ctypes import wintypes
 import sysenv
 
 IS_WINDOWS = sys.platform.startswith("win")
+# Win11 从 build 22000 起任务栏换成 XAML 实现，外部 AccentPolicy 就失效了；
+# Win10 上它仍然有效，而且不会牵动图标，所以两代要分开走。
+WIN11 = IS_WINDOWS and sys.getwindowsversion().build >= 22000
 
 # ---- AccentState ---------------------------------------------------------- #
 ACCENT_DISABLED = 0
@@ -119,7 +131,9 @@ WS_EX_LAYERED = 0x00080000
 GWL_EXSTYLE = -20
 LWA_ALPHA = 0x00000002
 
-MIN_ALPHA = 0.10        # 再低任务栏就只剩一点影子，容易以为它消失了
+MIN_ALPHA_WIN11 = 0.55  # Win11 整窗混合的下限：再低图标与文字就看不清了。
+# 实测 10% 时任务栏只剩一层淡影，图标对比度从 61 掉到 7（等于消失）。
+MIN_ALPHA = 0.0         # Win10 走 accent 的 alpha，0 = 背景全透、图标依然清晰
 
 
 def _get_exstyle(hwnd):
@@ -239,7 +253,9 @@ class PanelWin(object):
         return 1.0
 
     def min_alpha(self):
-        return MIN_ALPHA
+        # Win11 走整窗混合，前景跟着等比变淡，下限必须抬到图标还看得清的档位；
+        # Win10 走 accent，只改背景不动图标，可以一路到 0（全透）。
+        return MIN_ALPHA_WIN11 if WIN11 else MIN_ALPHA
 
     def blur_level(self):
         try:
@@ -258,12 +274,12 @@ class PanelWin(object):
             v = float(self.cfg["general"].get("alpha", "0.6"))
         except (TypeError, ValueError):
             v = 0.6
-        return max(MIN_ALPHA, min(self.max_alpha(), v))
+        return max(self.min_alpha(), min(self.max_alpha(), v))
 
     def set_alpha(self, value, smooth=False, sync_glass=True):
         # Windows 侧 apply_glass() 就是"把 accent 贴到任务栏"，不调用等于没设置，
         # 所以这里的 sync_glass 默认 True（与 panel_core 的语义差异是平台差异，不是遗漏）。
-        value = max(MIN_ALPHA, min(self.max_alpha(), float(value)))
+        value = max(self.min_alpha(), min(self.max_alpha(), float(value)))
         self.cfg["general"]["alpha"] = "%.3f" % value
         self.apply_glass()      # 透明度必须落到窗口上，因此不看 sync_glass
         return value
@@ -308,14 +324,10 @@ class PanelWin(object):
                 self._transparency_ok = bool(_enable_transparency(True))
 
         alpha = self.get_alpha()
-        alpha = max(MIN_ALPHA, min(1.0, alpha))
+        alpha = max(self.min_alpha(), min(1.0, alpha))
         if self.cfg["general"].get("alpha") != "%.3f" % alpha:
             # 老配置里可能有 0 或者超过 100% 的值，落盘前先修正，免得每次启动都重算
             self.cfg["general"]["alpha"] = "%.3f" % alpha
-
-        # 亚克力层：Win11 任务栏上只能拉动 ~23 级灰度，留着是因为旧系统（Win10）
-        # 和小尺寸窗口上它仍然有效；真正决定浓淡的是下面的整窗不透明度。
-        state = ACCENT_ENABLE_ACRYLICBLURBEHIND if self.glass_on() else ACCENT_DISABLED
 
         ok_any = False
         err = ""
@@ -329,12 +341,22 @@ class PanelWin(object):
                     # 否则上一次异常退出留下的 layered 会被当成原值记住，
                     # restore 之后永远摘不掉（虽然视觉上不透明，但状态是脏的）。
                     self._ex_style[h] = _get_exstyle(h) & ~WS_EX_LAYERED
-                if state:
-                    _set_accent(h, state, 0x00000000)
-                if _set_opacity(h, alpha):
-                    ok_any = True
-                elif not err:
-                    err = "SetLayeredWindowAttributes 调用失败"
+                if WIN11:
+                    # Win11：accent 打不穿 XAML 层（实测 1 级都拉不动），
+                    # 只做整窗不透明度，代价是图标跟着变淡。
+                    if _set_opacity(h, alpha):
+                        ok_any = True
+                    elif not err:
+                        err = "SetLayeredWindowAttributes 调用失败"
+                else:
+                    # Win10：accent 的 alpha 真有效，只压背景，图标清晰。
+                    state = (ACCENT_ENABLE_ACRYLICBLURBEHIND if self.glass_on()
+                             else ACCENT_DISABLED)
+                    tint = int(round(alpha * 255)) << 24     # AABBGGRR：纯黑，alpha 可调
+                    if _set_accent(h, state, tint):
+                        ok_any = True
+                    elif not err:
+                        err = "SetWindowCompositionAttribute 调用失败"
             except PanelError as e:
                 err = str(e)
             except Exception as e:
