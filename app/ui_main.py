@@ -20,7 +20,8 @@ from PyQt5.QtGui import (QColor, QPainter, QLinearGradient, QPainterPath, QPen,
                          QBrush, QIcon, QPixmap)
 from PyQt5.QtWidgets import (QWidget, QLabel, QPushButton, QSlider, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QFrame, QStackedWidget,
-                             QAbstractButton, QSizePolicy, QFileDialog, QApplication)
+                             QAbstractButton, QSizePolicy, QFileDialog, QApplication,
+                             QComboBox)
 
 import launchers
 import rules
@@ -56,6 +57,49 @@ def app_icon(pal, size=64):
 # --------------------------------------------------------------------------- #
 # 基础控件
 # --------------------------------------------------------------------------- #
+class StyleCombo(QComboBox):
+    """档位下拉：保留原生弹层，只自己画右边那个三角。
+
+    QSS 里用 border 拼三角在 Qt 上不生效（实测画出来是个小方块），
+    给 ::down-arrow 指定图片又得带一份资源文件，所以直接画两笔。
+    """
+
+    def __init__(self, pal, parent=None):
+        super(StyleCombo, self).__init__(parent)
+        self.pal = pal
+        self.setStyleSheet(self._qss())
+
+    def _qss(self):
+        pal = self.pal
+        return """
+        QComboBox{border:1px solid %s;border-radius:8px;background:%s;
+            color:%s;font-size:12px;padding:0 28px 0 12px;}
+        QComboBox:hover{border:1px solid %s;}
+        QComboBox::drop-down{border:none;width:22px;background:transparent;}
+        QComboBox QAbstractItemView{border:1px solid %s;border-radius:8px;
+            background:%s;color:%s;selection-background-color:%s;
+            selection-color:#FFFFFF;outline:none;padding:4px;}
+        QComboBox QAbstractItemView::item{height:26px;padding-left:8px;}
+        """ % (pal.line.name(), pal.card.name(), pal.text.name(), pal.accent.name(),
+               pal.line.name(), pal.card.name(), pal.text.name(), pal.accent.name())
+
+    def paintEvent(self, e):
+        super(StyleCombo, self).paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        cx = self.width() - 16.0
+        cy = self.height() / 2.0
+        path = QPainterPath()
+        path.moveTo(cx - 4.0, cy - 2.0)
+        path.lineTo(cx + 4.0, cy - 2.0)
+        path.lineTo(cx, cy + 3.0)
+        path.closeSubpath()
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.pal.muted)
+        p.drawPath(path)
+        p.end()
+
+
 class Switch(QAbstractButton):
     def __init__(self, pal, parent=None):
         super(Switch, self).__init__(parent)
@@ -395,12 +439,10 @@ class MainWindow(QWidget):
         t = QLabel("任务栏外观" if sysenv.IS_WINDOWS else "任务栏透明度")
         t.setFont(pal.font_ui(17, bold=True))
         t.setStyleSheet("color:%s;" % pal.text.name())
-        # 文案按平台分开写，且不粉饰：Win11 的任务栏背景是 explorer 内部的 XAML
-        # 表面，外部程序碰不到（TranslucentTB 是靠注入 explorer 才做到的）。
-        # 这里把两条真能用的路摆在前面，用户才不会反复拖滑块找那种"背景透、
-        # 图标清晰"的效果——那个效果本工具给不了。
+        # 文案按平台分开写：Win11 的任务栏背景是 explorer 内部的 XAML 表面，
+        # 进程外改不动，所以这里给的是「选一档」而不是「拖一个连续值」。
         if sysenv.IS_WINDOWS:
-            sub_text = "三种形态，一次只能开一个"
+            sub_text = "只影响任务栏，退出程序自动还原"
         else:
             sub_text = "拉低就透出壁纸，磨砂质感始终保留"
         sub = QLabel(sub_text)
@@ -411,11 +453,57 @@ class MainWindow(QWidget):
         box.addWidget(sub)
         head.addLayout(box)
         head.addStretch(1)
+        # 百分比只对麒麟的连续可调有意义；Windows 改成固定档位后不再显示数字
         self.pct = QLabel("60%")
         self.pct.setFont(pal.font_display(26))
         self.pct.setStyleSheet("color:%s;" % pal.accent.name())
-        head.addWidget(self.pct)
+        if not sysenv.IS_WINDOWS:
+            head.addWidget(self.pct)
         lay.addLayout(head)
+
+        # ---------------------------------------------------------------- #
+        # Windows：一个下拉选档位。原来那套「滑块 + 百分比 + 两个开关」
+        # 把同一件事拆成了四处，用户得先理解三种形态互斥才敢动手；
+        # 改成档位后所见即所得，也不会出现"滑块在中间到底是哪种形态"。
+        # 控件仍然创建（下面的方法会引用），只是不加进布局。
+        # ---------------------------------------------------------------- #
+        if sysenv.IS_WINDOWS:
+            self.style_row = QWidget()
+            self.style_row.setStyleSheet("background:transparent;")
+            sr = QHBoxLayout(self.style_row)
+            sr.setContentsMargins(0, 4, 0, 0)
+            sr.setSpacing(12)
+            st = QVBoxLayout()
+            st.setSpacing(1)
+            s_lab = QLabel("任务栏样式")
+            s_lab.setStyleSheet("color:%s;font-size:13px;font-weight:600;"
+                                % pal.text.name())
+            st.addWidget(s_lab)
+            sr.addLayout(st, 1)
+
+            self.style_combo = StyleCombo(pal)
+            self.style_combo.setCursor(Qt.PointingHandCursor)
+            self.style_combo.setFixedWidth(184)
+            self.style_combo.setFixedHeight(32)
+            for key, label, _v in self.app.panel.STYLES:
+                self.style_combo.addItem(label, key)
+            self.style_combo.currentIndexChanged.connect(self._on_style)
+            sr.addWidget(self.style_combo, 0, Qt.AlignVCenter)
+            lay.addWidget(self.style_row)
+
+            self.style_note = QLabel("")
+            self.style_note.setWordWrap(True)
+            self.style_note.setStyleSheet("color:%s;font-size:10.5px;" % pal.muted.name())
+            self.style_note.setVisible(False)
+            lay.addWidget(self.style_note)
+
+            # 这一页只有一个下拉会显得空，把「各档实际差别」摆出来，省得一个个试。
+            # 常显而不是按档位显隐：用户选之前就想知道差别，选完才告诉他就晚了。
+            self.style_help = self._hint_card(
+                "完全透明：背景整块去掉，图标保持原样，效果最干净。\n"
+                "半透明：数字是背景的浓度，越小越透；只压背景，图标和文字始终清晰。\n"
+                "自动隐藏：整条让位给壁纸，鼠标碰屏幕底边才滑出来，图标零损失。")
+            lay.addWidget(self.style_help)
 
         # 注入全透明（Windows 独有，v1.0.6+）：真把任务栏背景摘掉，图标不受影响
         self.inject_row = QWidget()
@@ -426,7 +514,7 @@ class MainWindow(QWidget):
         r1t.setSpacing(1)
         a1 = QLabel("任务栏完全透明")
         a1.setStyleSheet("color:%s;font-size:13px;font-weight:600;" % pal.text.name())
-        b1 = QLabel("背景整块去掉、图标原样清晰（与 TranslucentTB 同机制）。"
+        b1 = QLabel("背景整块去掉、图标原样清晰。"
                     "杀软可能拦截，彻底卸载需重启资源管理器")
         b1.setWordWrap(True)
         b1.setStyleSheet("color:%s;font-size:10.5px;" % pal.muted.name())
@@ -436,7 +524,8 @@ class MainWindow(QWidget):
         self.sw_inject = Switch(pal)
         self.sw_inject.toggled.connect(self._on_inject)
         r1.addWidget(self.sw_inject, 0, Qt.AlignTop)
-        lay.addWidget(self.inject_row)
+        if not sysenv.IS_WINDOWS:
+            lay.addWidget(self.inject_row)
         supports_inject = getattr(self.app.panel, "supports_inject", lambda: False)()
         self.inject_row.setVisible(supports_inject)
 
@@ -446,7 +535,8 @@ class MainWindow(QWidget):
         self.inject_note.setWordWrap(True)
         self.inject_note.setStyleSheet("color:%s;font-size:10.5px;" % pal.muted.name())
         self.inject_note.setVisible(False)
-        lay.addWidget(self.inject_note)
+        if not sysenv.IS_WINDOWS:
+            lay.addWidget(self.inject_note)
 
         # 自动隐藏（Windows 独有）：这是外部程序唯一能做到"图标零损失"的办法
         self.autohide_row = QWidget()
@@ -466,7 +556,8 @@ class MainWindow(QWidget):
         self.sw_autohide = Switch(pal)
         self.sw_autohide.toggled.connect(self._on_autohide)
         r0.addWidget(self.sw_autohide, 0, Qt.AlignTop)
-        lay.addWidget(self.autohide_row)
+        if not sysenv.IS_WINDOWS:
+            lay.addWidget(self.autohide_row)
         self.autohide_row.setVisible(self.app.panel.supports_autohide())
 
         # 下面这一组是"整窗淡出"：自动隐藏开着时整组收起，两套机制不叠加
@@ -509,7 +600,8 @@ class MainWindow(QWidget):
 
         self.preview = GlassPreview(pal)
         fb.addWidget(self.preview)
-        lay.addWidget(self.fade_box)
+        if not sysenv.IS_WINDOWS:
+            lay.addWidget(self.fade_box)
 
         # 玻璃质感
         self.glass_row = QWidget()
@@ -530,9 +622,12 @@ class MainWindow(QWidget):
         self.sw_glass = Switch(pal)
         self.sw_glass.toggled.connect(self._on_glass)
         row1.addWidget(self.sw_glass, 0, Qt.AlignTop)
-        lay.addWidget(self.glass_row)
+        # 玻璃质感是麒麟特有的系统磨砂开关，Windows 上整行不进布局：
+        # 留着它只会让人以为"半透明 + 玻璃质感"能叠着调。
+        if not sysenv.IS_WINDOWS:
+            lay.addWidget(self.glass_row)
 
-        # 和第三方任务栏工具（TranslucentTB 等）抢同一块任务栏，只能二选一
+        # 和第三方任务栏美化工具抢同一块任务栏，只能二选一
         self.tools_hint = QLabel("")
         self.tools_hint.setWordWrap(True)
         self.tools_hint.setFont(pal.font_mono(9.5))
@@ -563,13 +658,9 @@ class MainWindow(QWidget):
         lay.addWidget(self.blur_row)
         lay.addSpacing(4)
         if sysenv.IS_WINDOWS:
-            # 旧文案说"外部程序改不动任务栏背景"，v1.0.6 起我们自己把注入做出来了。
-            # 三种形态的代价必须写明白，否则用户会在"图标变淡"和"找不到任务栏"里犯懵。
-            self.win_hint = self._hint_card(
-                "任务栏背景由系统自己画，只有往 explorer 里送组件才能「完全透明」"
-                "（TranslucentTB 同理）。代价：杀软可能拦、卸载要重启资源管理器。"
-                "退出程序一律还原。")
-            lay.addWidget(self.win_hint)
+            # 各档差别已经由上面那张 style_help 讲清楚了，这里不再叠一张卡片：
+            # 两张说明挤在一起，用户反而两条都不看。
+            pass
         else:
             lay.addWidget(self._hint_card(
                 "磨砂由系统合成器（ukui-kwin）渲染。任务栏没变化时先确认两件事："
@@ -962,6 +1053,10 @@ class MainWindow(QWidget):
         """ % (pal.line.name(), pal.muted.name(), pal.card_hi.name(),
                pal.accent.name(), pal.accent.name(), pal.card_hi.name())
 
+    def _combo_qss(self):
+        """档位下拉的样式在 StyleCombo 内部维护，这里只为兼容旧调用点。"""
+        return StyleCombo(self.pal)._qss()
+
     # -- 背景 ---------------------------------------------------------------
     def paintEvent(self, e):
         p = QPainter(self)
@@ -1178,6 +1273,30 @@ class MainWindow(QWidget):
             self.panel_status.setText("设置失败：%s" % e)
             self._apply_mode_ui()          # 以真实状态回同步，别让开关停在"开"
 
+    def _on_style(self, _idx=None):
+        """下拉切档位。失败（注入被拦、组件被删）就把下拉拨回真实档位，不留假选项。"""
+        try:
+            key = self.style_combo.currentData()
+            label = dict((k, l) for k, l, _v in self.app.panel.STYLES).get(key, key)
+            if key == "clear":
+                self.panel_status.setText("正在把透明组件送进资源管理器……")
+                QApplication.processEvents()    # 注入要等对方回应，先让这句话上屏
+            self.app.panel.set_style(key)
+            self.app.save_cfg()
+            self._apply_mode_ui()
+            if key == "clear":
+                msg = "任务栏已完全透明：背景交给壁纸，图标不受影响"
+            elif key == "autohide":
+                msg = "任务栏已设为自动隐藏：鼠标碰到屏幕底边才滑出来"
+            elif key == "default":
+                msg = "任务栏已回到系统默认外观"
+            else:
+                msg = "任务栏样式已设为「%s」" % label
+            self.panel_status.setText(msg)
+        except Exception as e:
+            self.panel_status.setText("设置失败：%s" % e)
+            self._apply_mode_ui()
+
     def _apply_mode_ui(self):
         """按当前实际状态同步界面：开关位置、各组是否可见、第三方工具提示。"""
         try:
@@ -1189,6 +1308,28 @@ class MainWindow(QWidget):
         except Exception:
             mode = "fade"
         inj = mode == getattr(self.app.panel, "MODE_INJECT", "inject")
+
+        # Windows：下拉 + 一行说明。档位由后端 current_style() 推导，
+        # 不信界面自己的记忆——注入失败时后端会把配置退回，界面必须跟着退。
+        if hasattr(self, "style_combo"):
+            try:
+                key = self.app.panel.current_style()
+            except Exception:
+                key = "default"
+            idx = self.style_combo.findData(key)
+            if idx >= 0 and idx != self.style_combo.currentIndex():
+                self.style_combo.blockSignals(True)
+                self.style_combo.setCurrentIndex(idx)
+                self.style_combo.blockSignals(False)
+            if hasattr(self, "style_note"):
+                notes = {
+                    "clear": "已生效：任务栏背景交给壁纸，图标原样。资源管理器重启后会自动重连；"
+                             "想彻底卸掉这份组件，重启一次资源管理器即可。",
+                    "autohide": "已生效：任务栏收进屏幕边缘，鼠标碰到最底下一行才滑出来。",
+                }
+                self.style_note.setText(notes.get(key, ""))
+                self.style_note.setVisible(key in notes)
+
         if hasattr(self, "sw_autohide"):
             self.sw_autohide.set_silent(auto)
         if hasattr(self, "sw_inject"):
@@ -1210,9 +1351,11 @@ class MainWindow(QWidget):
             except Exception:
                 tools = []
             if tools:
+                # 只说是"第三方工具"，不点名：这页是给普通用户看的，
+                # 点名既没必要，也容易让人以为必须装那个东西。
                 self.tools_hint.setText(
-                    "检测到 %s 正在运行：它和本工具改的是同一块任务栏，同时启用会互相覆盖"
-                    % "、".join(tools))
+                    "检测到有第三方任务栏美化工具正在运行：它和本工具改的是同一块任务栏，"
+                    "两者同时启用会互相覆盖，建议只留一个")
             self.tools_hint.setVisible(bool(tools))
 
     def _on_glass(self, on):

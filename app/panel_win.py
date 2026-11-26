@@ -8,7 +8,7 @@
 （取样任务栏 2560x60 物理像素，均亮度/标准差/图标对比度三指标都不动）：
   - SetWindowCompositionAttribute：AccentState 0~5 × alpha 0/128/255
     （注意：官方未公开常量表里 1=GRADIENT、2=TRANSPARENTGRADIENT、
-      3=BLURBEHIND、4=ACRYLICBLURBEHIND，2 才是 TranslucentTB 的 Clear）
+      3=BLURBEHIND、4=ACRYLICBLURBEHIND，2 才是「整条透明」那一档）
     贴上去只有 2 号状态能拉动 4 级（37.32 → 41.57），其余纹丝不动
   - DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE = 2/3/4)：HRESULT=0 但无变化
   - 注册表 TaskbarAcrylicOpacity：重启 explorer 后依然无变化
@@ -16,20 +16,22 @@
     标准差 0.00、图标对比度 0.0 —— 图标和背景是同一个视觉树，拆不开
   - 色键透明（WS_EX_LAYERED + LWA_COLORKEY）：无变化，DComp 内容不走重定向表面
 
-TranslucentTB 能做到「背景透明 + 图标清晰」，源码（ExplorerTAP）显示它注入
-explorer 后拿到任务栏背景那个 XAML Shape，直接换掉 Fill 画刷，并 subclass
-任务栏窗口在 WM_PAINT 里涂黑客户区 —— 全部发生在 explorer 进程内部。
-它是签过名的知名项目，所以杀软不拦。
+市面上的第三方任务栏美化工具能做到「背景透明 + 图标清晰」，它的思路（ExplorerTAP）
+是注入 explorer 后拿到任务栏背景那个 XAML Shape，直接换掉 Fill 画刷 —— 全部
+发生在 explorer 进程内部。这类工具签过名，所以杀软不拦。
 
 v1.0.6 起本程序也走这条路了：`inject/` 下是一个零依赖的 Rust DLL（走 XAML
-Diagnostics，和 TTB 同一机制但代码是重写的），由 taskbar_tap.py 送进 explorer。
+Diagnostics，同一机制但代码是重写的），由 taskbar_tap.py 送进 explorer。
 实测 Win11 26200 上背景真正消失、图标不受影响，且能原样还原。
 
+v1.0.7 起注入还多了一种用法：不摘画刷，只把背景矩形的 Opacity 压低，
+于是「半透明」也能做到背景变淡、图标不变——整窗 alpha 做不到这一点。
+
 三条路（互斥，按用户选择走一条）：
-  A. 注入全透明（v1.0.6+）：真透，背景交给壁纸，图标零损失；代价是要往 explorer
-     塞一个 DLL（杀软可能拦），且卸载得等 explorer 重启
+  A. 注入（v1.0.6+）：透明档真透、半透明档只压背景，图标零损失；代价是要往
+     explorer 塞一个 DLL（杀软可能拦），且卸载得等 explorer 重启
   B. 自动隐藏：系统原生，整条让位给壁纸，图标零损失，可逆
-  C. WS_EX_LAYERED 整窗不透明度：能透出桌面，但图标与文字等比变淡
+  C. WS_EX_LAYERED 整窗不透明度：能透出桌面，但图标与文字等比变淡（兜底方案）
 
 Win10（build < 22000）上 AccentPolicy 的 alpha 仍然有效，走 accent 分支，
 可以做到「背景透、图标清晰」；Win11 才需要上面三条。
@@ -187,7 +189,7 @@ def _appbar(state=None):
     return int(abd.lParam)
 
 
-# TranslucentTB 这类工具和本程序改的是同一块任务栏，后写的会覆盖先写的。
+# 第三方任务栏美化工具和本程序改的是同一块任务栏，后写的会覆盖先写的。
 # 检测到就提示用户二选一，而不是让两个程序互相打架。
 _TASKBAR_TOOLS = ("TranslucentTaskbar", "TranslucentTB", "RoundedTB",
                   "ExplorerPatcher", "TaskbarX", "StartAllBack")
@@ -369,6 +371,9 @@ class PanelWin(object):
         if mode == self.MODE_AUTOHIDE:
             info["自动隐藏"] = "已开启" if self.get_autohide() else "未生效"
         elif mode == self.MODE_INJECT:
+            a = self.inject_tint()
+            info["形态"] = ("完全透明（注入）" if a <= 0.001
+                           else "半透明（注入 %d%%）" % int(round(a * 100)))
             info["注入组件"] = "已连上" if tap.is_active() else "未连上"
             info["组件来源"] = tap.dll_source() or "缺失"
         else:
@@ -464,20 +469,24 @@ class PanelWin(object):
         _appbar(state)
         return self.get_autohide() == bool(on)
 
-    def set_taskbar_mode(self, mode):
+    def set_taskbar_mode(self, mode, tint=None):
         """三种形态互斥：同一时刻只能有一种在管任务栏。
 
-        自动隐藏 / 整窗淡出 / 注入全透明 都会改动同一块表面，叠在一起必然互相覆盖
-        （例如注入了还开着 layered，透明就变成"壁纸 × 半透明"的浑浊色）。
+        自动隐藏 / 整窗淡出 / 注入（全透明或背景着色）都会改动同一块表面，叠在一起
+        必然互相覆盖（例如注入了还开着 layered，透明就变成"壁纸 × 半透明"的浑浊色）。
         所以切到哪个，先把另外两个摘干净。
+
+        tint：注入形态下的背景浓度。0 = 整块去掉，0~1 = 只把背景压淡、图标不动。
         """
         if mode not in (self.MODE_AUTOHIDE, self.MODE_INJECT):
             mode = self.MODE_FADE
         prev = self.taskbar_mode()
         self.cfg["general"]["taskbar_mode"] = mode
+        if tint is not None:
+            self.cfg["general"]["inject_tint"] = "%.3f" % max(0.0, min(1.0, tint))
 
         if prev == self.MODE_INJECT and mode != self.MODE_INJECT:
-            # 离开注入模式：先把画刷还回去，再卸别的
+            # 离开注入模式：先把画刷/透明度还回去，再卸别的
             try:
                 tap.restore()
             except Exception:
@@ -493,7 +502,8 @@ class PanelWin(object):
         if mode == self.MODE_INJECT:
             self._drop_opacity()
             self.set_autohide(False)
-            ok, err = tap.apply_clear()
+            want = self.inject_tint()
+            ok, err = tap.apply_tint(want) if want > 0.001 else tap.apply_clear()
             if not ok:
                 # 注入失败就把配置退回去，别留下"开关是开的、任务栏没变"的脏状态
                 self.cfg["general"]["taskbar_mode"] = prev
@@ -509,6 +519,85 @@ class PanelWin(object):
     def running_taskbar_tools(self):
         """正在运行的第三方任务栏外观工具。和它们抢同一块任务栏，只能二选一。"""
         return _running_taskbar_tools() if IS_WINDOWS else []
+
+    # -- 外观档位（给界面用的固定值，取代原来的滑块）------------------------
+    # 每个档位背后其实是「形态 + 浓度」两件事，打包成一个 key，
+    # 界面只认 key，切换逻辑集中在这里，以后加档位不用动 UI。
+    #   None 表示这一档不靠浓度实现，而是走 inject / autohide 形态。
+    #   半透明档 = 注入后把背景那块矩形的 Opacity 压低，图标不在里面，
+    #   所以「背景变淡、图标照旧清晰」——整窗 alpha 做不到这一点（55% 以下图标就糊了）。
+    STYLES = (
+        ("default",  "系统默认",          1.00),
+        ("clear",    "完全透明",          None),
+        ("tint10",   "半透明 · 10%",      0.10),
+        ("tint20",   "半透明 · 20%",      0.20),
+        ("tint40",   "半透明 · 40%",      0.40),
+        ("tint55",   "半透明 · 55%",      0.55),
+        ("tint72",   "半透明 · 72%",      0.72),
+        ("tint85",   "半透明 · 85%",      0.85),
+        ("autohide", "自动隐藏",          None),
+    )
+
+    def current_style(self):
+        """当前实际生效的档位 key。
+
+        不另存一个 style 字段：形态和浓度本来就已经落在配置里，
+        多存一份等于给"配置和现实不一致"留了个后门。
+        """
+        mode = self.taskbar_mode()
+        if mode == self.MODE_AUTOHIDE:
+            return "autohide"
+        if mode == self.MODE_INJECT:
+            a = self.inject_tint()
+            if a <= 0.001:
+                return "clear"
+        else:
+            a = self.get_alpha()
+        for key, _label, val in self.STYLES:
+            if val is not None and abs(val - a) < 0.04:
+                return key
+        # 老配置里可能是任意值（比如 0.6），挑最接近的档位显示，不假装精确
+        best = min((s for s in self.STYLES if s[2] is not None),
+                   key=lambda s: abs(s[2] - a))
+        return best[0]
+
+    def inject_tint(self):
+        """注入档位的背景浓度：0 = 整块去掉，0~1 = 只压背景的透明度。"""
+        try:
+            return float(self.cfg["general"].get("inject_tint") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def set_style(self, key):
+        """按档位切换。切哪个都先把另外两种形态摘干净，避免叠在一起互相糊。"""
+        if not any(k == key for k, _l, _v in self.STYLES):
+            key = "default"
+        if key == "clear":
+            return self.set_taskbar_mode(self.MODE_INJECT, 0.0)
+        if key == "autohide":
+            return self.set_taskbar_mode(self.MODE_AUTOHIDE)
+
+        alpha = dict((k, v) for k, _l, v in self.STYLES)[key]
+        if alpha >= 0.999:
+            # 「系统默认」既不留在注入形态（那会让组件一直被钉在 explorer 里），
+            # 也不留一个 255 的 layered 标志（视觉一样，但 restore 时多一层要还）。
+            if self.taskbar_mode() != self.MODE_FADE:
+                self.set_taskbar_mode(self.MODE_FADE)
+            self.set_alpha(1.0)
+            self._drop_opacity()
+            return key
+
+        if self.supports_inject():
+            # 注入能给"背景淡、图标清晰"，优先走它
+            return self.set_taskbar_mode(self.MODE_INJECT, alpha)
+
+        # 没有注入组件（安装包缺文件 / 杀软删了）时的兜底：整窗淡出。
+        # 最低只能到 0.55——再低图标和文字一起糊成一片，还不如不给这档。
+        alpha = max(0.55, alpha)
+        if self.taskbar_mode() != self.MODE_FADE:
+            self.set_taskbar_mode(self.MODE_FADE)
+        self.set_alpha(alpha)
+        return key
 
     def _drop_opacity(self):
         """摘掉我们自己贴的 layered，不动用户的其他设置。"""
@@ -559,7 +648,8 @@ class PanelWin(object):
         if self.taskbar_mode() == self.MODE_INJECT:
             # 注入模式下画刷由 explorer 里的组件管，这里什么都不该碰：
             # 一贴 layered 就把"真透明"糊成半透明，前面注入的功夫全废。
-            return tap.apply_clear()
+            want = self.inject_tint()
+            return tap.apply_tint(want) if want > 0.001 else tap.apply_clear()
 
         if self.taskbar_mode() == self.MODE_AUTOHIDE:
             # 自动隐藏模式下不再叠加整窗透明：两者一起用会既看不见任务栏、
@@ -632,7 +722,8 @@ class PanelWin(object):
             try:
                 if not tap.is_active() and time.time() - self._tap_try > 20.0:
                     self._tap_try = time.time()
-                    tap.apply_clear()
+                    want = self.inject_tint()
+                    (tap.apply_tint(want) if want > 0.001 else tap.apply_clear())
             except Exception:
                 pass
             self._last_hwnds = hwnds

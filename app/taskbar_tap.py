@@ -13,7 +13,7 @@ Win11 的任务栏背景不是窗口颜色，而是 explorer 进程里一块 XAM
   * 隐藏 DesktopWindowContentBridge 子窗口 → 背景没了，图标也没了（同一棵树）
   * 色键透明 LWA_COLORKEY → DComp 内容不走重定向表面，无效
 
-TranslucentTB 也是注入，走的是 XAML Diagnostics。本模块配 `do_inject.dll` 复刻这条
+市面上的第三方工具也是注入，走的是 XAML Diagnostics。本模块配 `do_inject.dll` 复刻这条
 路（自己实现，不抄代码）：
 
   1. SetWindowsHookEx(WH_CALLWNDPROC) 把 DLL 送进 explorer
@@ -66,8 +66,8 @@ def _candidates():
     """按优先级列出 do_inject.dll 的可能位置，兼容「源码目录」「安装目录」「打包 exe」。
 
     打包（PyInstaller --onefile）有个坑：模块会被**平铺解压**到临时目录根部，
-    本文件的 __file__ 是 `_MEIxxxx\taskbar_tap.py`（不在 app\ 子目录里），
-    所以不能只靠 __file__ 往上推 —— 必须直接用 sys._MEIPASS 拼 tap\。
+    本文件的 __file__ 是 `_MEIxxxx/taskbar_tap.py`（不在 app/ 子目录里），
+    所以不能只靠 __file__ 往上推 —— 必须直接用 sys._MEIPASS 拼 tap/。
     """
     here = os.path.dirname(os.path.abspath(__file__))        # 源码=…/app；打包=_MEIxxxx
     root = os.path.dirname(here)                             # 源码=仓库根；打包=Temp（无用）
@@ -321,6 +321,28 @@ def apply_clear():
         _wait_for("已清空", 3.0)
     else:
         _wait_for("已清空", 2.0)
+    if tap_pid() != explorer_pid():
+        return False, "注入组件没能连上任务栏"
+    return True, ""
+
+
+def apply_tint(alpha):
+    """把任务栏背景压到 alpha（0~1），图标不动。返回 (成功?, 错误信息)。
+
+    和 apply_clear 的区别：clear 是把背景矩形的画刷摘掉（整块消失），
+    tint 是留着画刷、只把**这块矩形**的 Opacity 压下去——图标不在这个元素里，
+    所以背景淡了、图标还是原样清晰。整窗 alpha 做不到这一点（图标会一起糊）。
+    """
+    alpha = max(0.0, min(1.0, float(alpha)))
+    os.makedirs(STATE_DIR, exist_ok=True)
+    write_cmd("tint %.3f" % alpha)
+    if not is_active():
+        ok, err = inject()
+        if not ok:
+            return False, err
+        _wait_for("调到", 3.0)
+    else:
+        _wait_for("调到", 2.0)
     if tap_pid() != explorer_pid():
         return False, "注入组件没能连上任务栏"
     return True, ""

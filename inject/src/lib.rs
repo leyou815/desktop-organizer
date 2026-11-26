@@ -4,16 +4,16 @@
 //!   Win11 任务栏的背景是一块 XAML `Shape`（元素名 `BackgroundFill`），和图标一起画在
 //!   explorer 的同一个视觉树里。进程外没有任何 API 能只改背景——实测
 //!   SetWindowCompositionAttribute 只拉动 4 级灰度、隐藏背景子窗口连图标一起消失、
-//!   色键把整条任务栏变成一块 #202020 死色块。TranslucentTB 的做法也是注入，
+//!   色键把整条任务栏变成一块 #202020 死色块。第三方工具的做法也是注入，
 //!   本文件按它的公开实现重写了一遍（不复制代码）：走 XAML Diagnostics。
 //!
-//! 链路（对着 xamlom.h 和 TTB 的 ExplorerTAP 逐个接口核过）：
+//! 链路（对着 xamlom.h 和公开的 ExplorerTAP 思路逐个接口核过）：
 //!   1. 宿主用 SetWindowsHookEx(WH_CALLWNDPROC) 把本 DLL 送进 explorer
 //!   2. DllMain 认出自己在 explorer 里 → 起线程调 Windows.UI.Xaml.dll 的
 //!      InitializeXamlDiagnosticsEx(conn, pid, null, 本DLL路径, CLSID_SITE, null)
 //!   3. XAML 按 CLSID 调本 DLL 的 DllGetClassObject → 我们的 TapSite
 //!   4. XAML 把 IXamlDiagnostics 塞进 TapSite::SetSite → 我们 QI 出 IVisualTreeService
-//!      并在**另一个线程**里 AdviseVisualTreeChange（TTB 注释：同线程会卡住）
+//!      并在**另一个线程**里 AdviseVisualTreeChange（同线程会卡住）
 //!   5. 逐条收到视觉树通知，挑出 `...Shapes.Shape` 且名字是 BackgroundFill /
 //!      BackgroundStroke 的元素，GetIInspectableFromHandle → QI IShape → put_Fill(null)
 //!   6. 原画刷 AddRef 存下来，收到 restore 命令时原样放回去
@@ -73,10 +73,16 @@ const IID_IXAMLDIAGNOSTICS: GUID = GUID { d1: 0x18C9_E2B6, d2: 0x3F43, d3: 0x411
 const IID_IVISUALTREESERVICE: GUID = GUID { d1: 0xA593_B11A, d2: 0xD17F, d3: 0x48BB,
                                             d4: [0x8F, 0x66, 0x83, 0x91, 0x07, 0x31, 0xC8, 0xA5] };
 // Windows.UI.Xaml.winmd 里 IShape 的 GuidAttribute 是二进制存的，这里是解出来的值
-// （Windows.UI.Xaml.Shapes.IShape = 786F2B75-9AA0-454D-AE06-A2466E37C832，
-//   方法顺序：slot3 get_Fill / slot4 put_Fill / slot5 get_Stroke / slot6 put_Stroke）
+// （Windows.UI.Xaml.Shapes.IShape = 786F2B75-9AA0-454D-AE06-A2466E37C832；
+//   它 ABI 上继承 IInspectable，所以 get_Fill 在 slot6、put_Fill 在 slot7，
+//   别再按 IUnknown 从 3 数——那样会调到 GetIids，explorer 当场崩）
 const IID_ISHAPE: GUID = GUID { d1: 0x786F_2B75, d2: 0x9AA0, d3: 0x454D,
                                 d4: [0xAE, 0x06, 0xA2, 0x46, 0x6E, 0x37, 0xC8, 0x32] };
+// Windows.UI.Xaml.IUIElement = 676D0BE9-B65C-41C6-BA40-58CF87F201C1
+// （同样从 Windows.UI.Xaml.winmd 的 GuidAttribute 解出来；方法顺序里
+//   get_Opacity 是第 4 个、put_Opacity 是第 5 个，加 IInspectable 的 6 格 → slot 9 / 10）
+const IID_IUIELEMENT: GUID = GUID { d1: 0x676D_0BE9, d2: 0xB65C, d3: 0x41C6,
+                                    d4: [0xBA, 0x40, 0x58, 0xCF, 0x87, 0xF2, 0x01, 0xC1] };
 
 // 我们自己这个「任务栏外观提供者」的类 ID，随便挑一个不会撞车的
 const CLSID_SITE: GUID = GUID { d1: 0x8D3A_1C7E, d2: 0x4B2F, d3: 0x4E6A,
@@ -307,18 +313,31 @@ unsafe fn shape_put_stroke(s: *mut c_void, brush: *mut c_void) -> HRESULT {
     f(s, brush)
 }
 
+// IUIElement::put_Opacity —— 只压这一块矩形的透明度，图标不在这个元素里，
+// 所以「半透明」是背景变淡、图标照旧清晰（整窗 alpha 做不到这一点）。
+unsafe fn ui_put_opacity(ui: *mut c_void, v: f64) -> HRESULT {
+    let p = slot(ui, 10);
+    let f: unsafe extern "system" fn(*mut c_void, f64) -> HRESULT = std::mem::transmute(p);
+    f(ui, v)
+}
+
 // --------------------------------------------------------------------------- //
 // 状态：被我们改过的画刷，以及当前命令
 // --------------------------------------------------------------------------- //
 const KIND_FILL: u8 = 0;
 const KIND_STROKE: u8 = 1;
+// 这一块背景现在是什么状态：0 没动过 / 1 画刷被摘掉（完全透明）/ 2 画刷还在、元素透明度被压低
+const ST_NONE: u8 = 0;
+const ST_CLEAR: u8 = 1;
+const ST_TINT: u8 = 2;
 
 struct Item {
     handle: InstanceHandle,
     shape: usize,      // IShape*
+    ui: usize,         // IUIElement*，用来调 Opacity；QI 失败就是 0（那一档就不动它）
     kind: u8,
     original: usize,   // 原画刷（带一个引用）
-    applied: bool,
+    state: u8,
     label: String,
 }
 
@@ -356,11 +375,11 @@ unsafe fn put_raw(shape: usize, kind: u8, brush: *mut c_void) -> HRESULT {
     }
 }
 
-fn mark_applied(shape: usize, kind: u8, applied: bool) {
+fn set_state(shape: usize, kind: u8, state: u8) {
     if let Ok(mut items) = ITEMS.lock() {
         for it in items.iter_mut() {
             if it.shape == shape && it.kind == kind {
-                it.applied = applied;
+                it.state = state;
             }
         }
     }
@@ -369,12 +388,15 @@ fn mark_applied(shape: usize, kind: u8, applied: bool) {
 // 关键约束：调 put_* 的时候**绝不能**持有 ITEMS 锁。
 // 换画刷会让 XAML 同步派发视觉树通知回来，那条路径（元素被移除时）也要锁 ITEMS，
 // 而 std 的 Mutex 不可重入 → 当场死锁把任务栏冻住。所以先拍快照、放锁、再动 COM。
-fn apply_all(why: &str) {
-    let targets: Vec<(usize, u8)> = match ITEMS.lock() {
+//
+// 两种「半透明」的区别（实测出来的）：
+//   * 整窗 layered alpha：连图标一起变淡，55% 以下图标几乎看不清 → 只当兜底
+//   * 元素 Opacity：只压这块背景矩形，图标不在里面 → 想要的"背景淡、图标清晰"
+fn apply_clear(why: &str) {
+    let targets: Vec<(usize, u8, usize, u8)> = match ITEMS.lock() {
         Ok(items) => items
             .iter()
-            .filter(|it| !it.applied)
-            .map(|it| (it.shape, it.kind))
+            .map(|it| (it.shape, it.kind, it.ui, it.state))
             .collect(),
         Err(_) => return,
     };
@@ -382,13 +404,21 @@ fn apply_all(why: &str) {
         return;
     }
     let mut n = 0;
-    for (shape, kind) in targets {
-        let hr = unsafe { put_raw(shape, kind, std::ptr::null_mut()) };
-        if hr >= 0 {
-            mark_applied(shape, kind, true);
-            n += 1;
-        } else {
-            log(&format!("{why}: 清空画刷失败 0x{:08X}", hr as u32));
+    for (shape, kind, ui, state) in targets {
+        if state != ST_CLEAR {
+            let hr = unsafe { put_raw(shape, kind, std::ptr::null_mut()) };
+            if hr >= 0 {
+                set_state(shape, kind, ST_CLEAR);
+                n += 1;
+            } else {
+                log(&format!("{why}: 清空画刷失败 0x{:08X}", hr as u32));
+                continue;
+            }
+        }
+        // 从「半透明」切过来时元素上还留着 <1 的透明度，顺手复位，
+        // 免得以后还原画刷时带着一个被压过的 opacity（那就成脏状态了）。
+        if ui != 0 {
+            unsafe { ui_put_opacity(ui as *mut c_void, 1.0) };
         }
     }
     if n > 0 {
@@ -396,12 +426,12 @@ fn apply_all(why: &str) {
     }
 }
 
-fn restore_all(why: &str) {
-    let targets: Vec<(usize, u8, usize)> = match ITEMS.lock() {
+fn apply_tint(alpha: f64, why: &str) {
+    let alpha = alpha.max(0.0).min(1.0);
+    let targets: Vec<(usize, usize, u8, usize, u8)> = match ITEMS.lock() {
         Ok(items) => items
             .iter()
-            .filter(|it| it.applied)
-            .map(|it| (it.shape, it.kind, it.original))
+            .map(|it| (it.shape, it.ui, it.kind, it.original, it.state))
             .collect(),
         Err(_) => return,
     };
@@ -409,17 +439,81 @@ fn restore_all(why: &str) {
         return;
     }
     let mut n = 0;
-    for (shape, kind, original) in targets {
-        let hr = unsafe { put_raw(shape, kind, original as *mut c_void) };
+    for (shape, ui, kind, original, state) in targets {
+        if ui == 0 {
+            log(&format!("{why}: 元素拿不到 IUIElement，跳过（{kind}）"));
+            continue;
+        }
+        if state == ST_CLEAR {
+            // 上一档把画刷摘掉了，先放回去，否则调 Opacity 也看不见东西
+            let hr = unsafe { put_raw(shape, kind, original as *mut c_void) };
+            if hr < 0 {
+                log(&format!("{why}: 放回画刷失败 0x{:08X}", hr as u32));
+                continue;
+            }
+        }
+        let hr = unsafe { ui_put_opacity(ui as *mut c_void, alpha) };
         if hr >= 0 {
-            mark_applied(shape, kind, false);
+            set_state(shape, kind, ST_TINT);
             n += 1;
         } else {
-            log(&format!("{why}: 还原画刷失败 0x{:08X}", hr as u32));
+            log(&format!("{why}: 设透明度失败 0x{:08X}", hr as u32));
         }
     }
     if n > 0 {
+        log(&format!("{why}: 已把 {} 块背景调到 {:.0}%", n, alpha * 100.0));
+    }
+}
+
+fn restore_all(why: &str) {
+    let targets: Vec<(usize, usize, u8, usize, u8)> = match ITEMS.lock() {
+        Ok(items) => items
+            .iter()
+            .filter(|it| it.state != ST_NONE)
+            .map(|it| (it.shape, it.ui, it.kind, it.original, it.state))
+            .collect(),
+        Err(_) => return,
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let mut n = 0;
+    for (shape, ui, kind, original, state) in targets {
+        if ui != 0 {
+            unsafe { ui_put_opacity(ui as *mut c_void, 1.0) };
+        }
+        if state == ST_CLEAR {
+            let hr = unsafe { put_raw(shape, kind, original as *mut c_void) };
+            if hr < 0 {
+                log(&format!("{why}: 还原画刷失败 0x{:08X}", hr as u32));
+                continue;
+            }
+        }
+        set_state(shape, kind, ST_NONE);
+        n += 1;
+    }
+    if n > 0 {
         log(&format!("{why}: 已还原 {n} 个画刷"));
+    }
+}
+
+/// inject.cmd 的语义：`clear` / `restore` / `probe` / `tint 0.20`
+fn parse_tint(cmd: &str) -> Option<f64> {
+    let rest = cmd.strip_prefix("tint")?;
+    let v = rest.trim_start_matches(|c: char| c == ' ' || c == ':' || c == '=')
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+    Some(v)
+}
+
+/// 按当前命令把状态刷一遍（新元素接进来、或宿主换了档位时都走这里）
+fn apply_current(why: &str) {
+    let cmd = current_mode();
+    if cmd == "clear" {
+        apply_clear(why);
+    } else if let Some(v) = parse_tint(&cmd) {
+        apply_tint(v, why);
     }
 }
 
@@ -589,9 +683,13 @@ unsafe fn drain_pending() {
         .map(|mut a| if a.is_empty() { String::new() } else { std::mem::take(&mut *a) })
         .unwrap_or_default();
     match act.as_str() {
-        "clear" => apply_all("命令 clear"),
+        "clear" => apply_clear("命令 clear"),
         "restore" => restore_all("命令 restore"),
-        _ => {}
+        _ => {
+            if let Some(v) = parse_tint(&act) {
+                apply_tint(v, "命令 tint");
+            }
+        }
     }
 
     // ② 再处理回调期间记下的目标元素
@@ -643,6 +741,15 @@ unsafe fn register_shape(handle: InstanceHandle, ty: &str, name: &str) {
         "  [4] {name}: get 画刷 hr=0x{:08X} brush={:p}",
         hr as u32, original
     ));
+    // 顺手要一个 IUIElement：半透明档位靠它的 Opacity 只压背景，不动图标。
+    // 拿不到不算错（完全透明不需要它），记下来那一档就跳过这个元素。
+    let mut ui: *mut c_void = std::ptr::null_mut();
+    let hr = com_qi(insp, &IID_IUIELEMENT as *const GUID, &mut ui);
+    log(&format!("  [3.6] QI IUIElement hr=0x{:08X} ui={:p}", hr as u32, ui));
+    if hr < 0 {
+        ui = std::ptr::null_mut();
+    }
+
     log("  [4.5] 准备 release insp");
     com_release(insp);
     log("  [4.6] insp 已释放");
@@ -650,24 +757,24 @@ unsafe fn register_shape(handle: InstanceHandle, ty: &str, name: &str) {
     if let Ok(mut items) = ITEMS.lock() {
         if items.iter().any(|it| it.shape == shape as usize && it.kind == kind) {
             com_release(shape);
+            if !ui.is_null() {
+                com_release(ui);
+            }
             return;
         }
         items.push(Item {
             handle,
             shape: shape as usize,
+            ui: ui as usize,
             kind,
             original: original as usize,
-            applied: false,
+            state: ST_NONE,
             label: name.to_string(),
         });
     }
 
-    match current_mode().as_str() {
-        "clear" => apply_all("收到 clear"),
-        _ => {
-            let _ = shape_get_fill; // 静默：probe 模式只看不动
-        }
-    }
+    // probe / restore 状态下这里什么都不做（只看不动）
+    apply_current("收到命令");
 }
 
 // --------------------------------------------------------------------------- //
@@ -749,7 +856,7 @@ unsafe extern "system" fn site_setsite(this: *mut c_void, punk: *mut c_void) -> 
     s.site.store(punk, Ordering::SeqCst);
     log("SetSite: 拿到 IXamlDiagnostics");
 
-    // TTB 的注释：在主线程里 Advise 会卡住，必须另起线程（回调本身会被 marshal 回 UI 线程）
+    // 实测：在主线程里 Advise 会卡住，必须另起线程（回调本身会被 marshal 回 UI 线程）
     let raw = this as usize;
     let cb = CALLBACK.load(Ordering::SeqCst);
     if cb.is_null() {
@@ -1053,18 +1160,20 @@ unsafe fn install() {
             continue;
         }
         *MODE.lock().unwrap_or_else(|e| e.into_inner()) = want.clone();
-        match want.as_str() {
+        if want == "probe" {
+            log("命令 probe：只看不动");
+            continue;
+        }
+        if want == "clear" || want == "restore" || parse_tint(&want).is_some() {
             // 不能在这个线程直接改画刷：COM 对象属于 UI 线程，跨线程裸调一样会让 explorer 崩。
             // 塞进 ACTION 再敲一下消息，让 UI 线程去执行。
-            "clear" | "restore" => {
-                if let Ok(mut a) = ACTION.lock() {
-                    *a = want.clone();
-                }
-                log(&format!("命令 {want} 已排队，等 UI 线程执行"));
-                post_work();
+            if let Ok(mut a) = ACTION.lock() {
+                *a = want.clone();
             }
-            "probe" => log("命令 probe：只看不动"),
-            other => log(&format!("未知命令 {other}")),
+            log(&format!("命令 {want} 已排队，等 UI 线程执行"));
+            post_work();
+        } else {
+            log(&format!("未知命令 {want}"));
         }
     });
 }
