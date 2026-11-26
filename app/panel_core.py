@@ -174,6 +174,10 @@ class PanelCore(object):
     def max_alpha(self):
         return GLASS_MAX_ALPHA if self.glass_on() else 1.0
 
+    def min_alpha(self):
+        # Linux 侧可以一路拖到全透（gsettings 支持 0），没有下限
+        return 0.0
+
     def get_alpha(self):
         raw = _unquote(_gget(SCHEMA_P, KEY_TRANS))
         try:

@@ -183,8 +183,10 @@ def cmd_panel(value):
         print("设置失败：%s" % e)
         return 2
     appcfg.save(cfg)
+    cap = pnl.max_alpha()
     print("任务栏透明度 %d%%%s" % (int(v * 100),
-                                "（玻璃质感上限 %d%%）" % 92 if pnl.glass_on() else ""))
+                                "（上限 %d%%）" % int(round(cap * 100))
+                                if cap < 1.0 else ""))
     return 0
 
 

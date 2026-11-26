@@ -399,7 +399,8 @@ class MainWindow(QWidget):
         # 方向是"数值越大越深越实"，和麒麟的 gsettings 透明度不完全一样，
         # 所以提示文案按平台分开写，别让用户按错方向找半天。
         if sysenv.IS_WINDOWS:
-            sub_text = "数值越小越贴近壁纸，越大越深越实；磨砂质感始终保留"
+            sub_text = "数值越小越透（能透出壁纸），越大越实；最低 %d%% 保住轮廓" \
+                       % int(round(self.app.panel.min_alpha() * 100))
         else:
             sub_text = "拉低就透出壁纸，磨砂质感始终保留"
         sub = QLabel(sub_text)
@@ -450,7 +451,10 @@ class MainWindow(QWidget):
         lay.addWidget(self.preview)
 
         # 玻璃质感
-        row1 = QHBoxLayout()
+        self.glass_row = QWidget()
+        self.glass_row.setStyleSheet("background:transparent;")
+        row1 = QHBoxLayout(self.glass_row)
+        row1.setContentsMargins(0, 0, 0, 0)
         r1t = QVBoxLayout()
         r1t.setSpacing(1)
         a = QLabel("玻璃质感")
@@ -465,7 +469,7 @@ class MainWindow(QWidget):
         self.sw_glass = Switch(pal)
         self.sw_glass.toggled.connect(self._on_glass)
         row1.addWidget(self.sw_glass, 0, Qt.AlignTop)
-        lay.addLayout(row1)
+        lay.addWidget(self.glass_row)
 
         # 磨砂强度（Windows 只有系统 Acrylic 一档，整行不显示）
         self.blur_row = QWidget()
@@ -899,14 +903,21 @@ class MainWindow(QWidget):
     # -- 数据刷新 -----------------------------------------------------------
     def refresh(self):
         cfg = self.cfg
-        alpha = self.app.panel.get_alpha()
+        lo = int(round(self.app.panel.min_alpha() * 100))
+        hi = int(round(self.app.panel.max_alpha() * 100))
+        # 配置里可能存着后端做不到的值（老版本拖到 0，而 Windows 下限是 10%）。
+        # 先夹到范围内再显示，否则会出现"数字 0% 但滑块停在 10%"的自相矛盾。
+        alpha = max(lo, min(hi, int(round(self.app.panel.get_alpha() * 100)))) / 100.0
         self.slider.blockSignals(True)
-        self.slider.setRange(0, int(round(self.app.panel.max_alpha() * 100)))  # 玻璃开=92，关=100
-        self.slider.setValue(min(100, int(round(alpha * 100))))
+        self.slider.setRange(lo, hi)
+        self.slider.setValue(int(round(alpha * 100)))
         self.slider.blockSignals(False)
         self._sync_panel(alpha)
 
         self.sw_glass.set_silent(self.app.panel.glass_on())
+        # Windows 上"玻璃质感"这个开关没有可见效果（系统磨砂由透明效果开关控制），
+        # 藏起来，别留一个按了没反应的开关。
+        self.glass_row.setVisible(not sysenv.IS_WINDOWS)
         lv = self.app.panel.blur_level()
         for k, b in self.blur_btns.items():
             b.setChecked(k == lv)

@@ -35,7 +35,7 @@ ACCENT_ENABLE_HOSTBACKDROP = 5
 WCA_ACCENT_POLICY = 19
 
 # 与麒麟版共用同一份常量/异常，避免两套定义各自漂移
-from panel_core import PanelError, PRESETS, BLUR_NAMES, GLASS_MAX_ALPHA  # noqa: E402
+from panel_core import PanelError, PRESETS, BLUR_NAMES  # noqa: E402
 
 
 if IS_WINDOWS:
@@ -106,6 +106,61 @@ def _set_accent(hwnd, state, color_argb):
     return bool(fn(hwnd, ctypes.byref(data)))
 
 
+# ---- 整窗不透明度（分层窗口）---------------------------------------------- #
+# Win11 26200 实测：SetWindowCompositionAttribute 的 GradientColor 贴到任务栏上，
+# 只能拉动约 23 级灰度（255 里的 9%）——纯黑和纯白分别是 217 和 240，肉眼几乎
+# 分不出。所以「把 alpha 映射成 RGB 明度」这条路在本机是死的，滑块拖到底也看不出
+# 变化。
+#
+# 真正能连续控制的是把任务栏窗口设成 layered，再用 SetLayeredWindowAttributes
+# 给整窗一个 0-255 的不透明度：实测线性、可逆、跨度 168 级。代价是图标和文字也
+# 一起变淡（这是整窗混合的必然结果），所以留一个下限，别让人彻底找不到任务栏。
+WS_EX_LAYERED = 0x00080000
+GWL_EXSTYLE = -20
+LWA_ALPHA = 0x00000002
+
+MIN_ALPHA = 0.10        # 再低任务栏就只剩一点影子，容易以为它消失了
+
+
+def _get_exstyle(hwnd):
+    _user32.GetWindowLongW.restype = ctypes.c_long
+    return _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+
+
+def _set_exstyle(hwnd, value):
+    _user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+    _user32.SetWindowLongW.restype = ctypes.c_long
+    return _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, value)
+
+
+def _set_opacity(hwnd, level):
+    """把整个任务栏窗口按 level(0~1) 半透明。成功返回 True。"""
+    try:
+        ex = _get_exstyle(hwnd)
+        if not (ex & WS_EX_LAYERED):
+            _set_exstyle(hwnd, ex | WS_EX_LAYERED)
+        _user32.SetLayeredWindowAttributes.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_ubyte, wintypes.DWORD]
+        _user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
+        a = int(round(255 * max(0.0, min(1.0, level))))
+        return bool(_user32.SetLayeredWindowAttributes(hwnd, 0, a, LWA_ALPHA))
+    except Exception:
+        return False
+
+
+def _clear_opacity(hwnd, orig_ex):
+    """还原：先回满不透明，再把 layered 标志摘掉。"""
+    try:
+        _user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
+    except Exception:
+        pass
+    try:
+        if orig_ex is not None:
+            _set_exstyle(hwnd, orig_ex)
+    except Exception:
+        pass
+
+
 def _enable_transparency(on=True):
     """确保系统「透明效果」是开的，否则任务栏是纯色。"""
     try:
@@ -131,7 +186,11 @@ def _transparency_enabled():
 
 
 def _system_light():
-    """系统当前是不是亮色主题（SystemUsesLightTheme=1）。读不到时默认亮色。"""
+    """系统当前是不是亮色主题（SystemUsesLightTheme=1）。读不到时默认亮色。
+
+    保留给外部排查用（cli diagnose / 手工实验）；贴透明度的主流程已经不再依赖
+    它——整窗 alpha 与深浅主题无关。
+    """
     try:
         import winreg
         path = (r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
@@ -151,6 +210,7 @@ class PanelWin(object):
         self._applied = False
         self._backed_up = False     # 原值只记一次，别每次贴 accent 都覆盖成"已改过"的值
         self._transparency_ok = False   # "透明效果"已经确保开启过，不必每次拖滑块都写注册表
+        self._ex_style = {}             # hwnd -> 动它之前的扩展样式，退出时按原样还回去
 
     # -- 能力 ---------------------------------------------------------------
     def supports_blur_level(self):
@@ -174,7 +234,12 @@ class PanelWin(object):
         return self.cfg["general"].get("glass", "1") == "1"
 
     def max_alpha(self):
-        return GLASS_MAX_ALPHA if self.glass_on() else 1.0
+        # 分层窗口能一路做到 100%（完全不透明），不再需要为了"别成实心色块"
+        # 把上限压到 92%。
+        return 1.0
+
+    def min_alpha(self):
+        return MIN_ALPHA
 
     def blur_level(self):
         try:
@@ -187,15 +252,18 @@ class PanelWin(object):
         self.cfg["general"]["blur_level"] = str(level)
 
     def get_alpha(self):
+        # 读数就夹在有效区间里：老配置里可能留着 0（当时以为能全透），
+        # 直接回显 0% 会跟界面上的 10% 对不上，diagnose 也会自相矛盾。
         try:
-            return max(0.0, min(1.0, float(self.cfg["general"].get("alpha", "0.6"))))
+            v = float(self.cfg["general"].get("alpha", "0.6"))
         except (TypeError, ValueError):
-            return 0.6
+            v = 0.6
+        return max(MIN_ALPHA, min(self.max_alpha(), v))
 
     def set_alpha(self, value, smooth=False, sync_glass=True):
         # Windows 侧 apply_glass() 就是"把 accent 贴到任务栏"，不调用等于没设置，
         # 所以这里的 sync_glass 默认 True（与 panel_core 的语义差异是平台差异，不是遗漏）。
-        value = max(0.0, min(self.max_alpha(), float(value)))
+        value = max(MIN_ALPHA, min(self.max_alpha(), float(value)))
         self.cfg["general"]["alpha"] = "%.3f" % value
         self.apply_glass()      # 透明度必须落到窗口上，因此不看 sync_glass
         return value
@@ -240,36 +308,33 @@ class PanelWin(object):
                 self._transparency_ok = bool(_enable_transparency(True))
 
         alpha = self.get_alpha()
-        if self.glass_on() and alpha > GLASS_MAX_ALPHA:
-            # 玻璃质感开着时透明度不能顶到 100%，否则就是一块实心色块。
-            # 这里联动收回来，配置文件里存的旧值也一起修正。
-            alpha = GLASS_MAX_ALPHA
+        alpha = max(MIN_ALPHA, min(1.0, alpha))
+        if self.cfg["general"].get("alpha") != "%.3f" % alpha:
+            # 老配置里可能有 0 或者超过 100% 的值，落盘前先修正，免得每次启动都重算
             self.cfg["general"]["alpha"] = "%.3f" % alpha
-        if self.glass_on():
-            state = ACCENT_ENABLE_ACRYLICBLURBEHIND
-        else:
-            # 关掉玻璃质感：只留模糊（仍半透明，但没有亚克力颗粒感）
-            state = ACCENT_ENABLE_BLURBEHIND
 
-        # 色调：透明度滑块映射到 RGB 明度。
-        # Win11 (10.0.26200) 实测：ACRYLICBLURBEHIND 的 GradientColor 里
-        #   - 最高字节 alpha 完全无效（00→FF 颜色纹丝不动）
-        #   - 低 24 位 RGB 才是任务栏底色（00=纯黑, 80=中灰, FF=近白）
-        # 所以必须把 alpha（0~1）映射成 RGB 明度，滑块才真正可控：
-        #   透明 0%  → 亮色主题偏白（透亮）/ 暗色主题偏黑（融进深色壁纸）
-        #   透明 92% → 亮色主题偏深（实心）/ 暗色主题偏亮（实心）
-        level = max(0.0, min(1.0, alpha))
-        if _system_light():
-            v = int(round(255 * (1.0 - level)))
-        else:
-            v = int(round(255 * level))
-        tint = (0x80 << 24) | (v << 16) | (v << 8) | v   # AABBGGRR: 0xAARRGGBB -> 灰阶
+        # 亚克力层：Win11 任务栏上只能拉动 ~23 级灰度，留着是因为旧系统（Win10）
+        # 和小尺寸窗口上它仍然有效；真正决定浓淡的是下面的整窗不透明度。
+        state = ACCENT_ENABLE_ACRYLICBLURBEHIND if self.glass_on() else ACCENT_DISABLED
+
         ok_any = False
         err = ""
+        alive = set(hwnds)
+        # 资源管理器重启后旧句柄作废，顺手清掉，免得 restore 时对野句柄操作
+        self._ex_style = {h: v for h, v in self._ex_style.items() if h in alive}
         for h in hwnds:
             try:
-                if _set_accent(h, state, tint):
+                if h not in self._ex_style:
+                    # 存"没被我们碰过"的样子：把 layered 位摘掉再记。
+                    # 否则上一次异常退出留下的 layered 会被当成原值记住，
+                    # restore 之后永远摘不掉（虽然视觉上不透明，但状态是脏的）。
+                    self._ex_style[h] = _get_exstyle(h) & ~WS_EX_LAYERED
+                if state:
+                    _set_accent(h, state, 0x00000000)
+                if _set_opacity(h, alpha):
                     ok_any = True
+                elif not err:
+                    err = "SetLayeredWindowAttributes 调用失败"
             except PanelError as e:
                 err = str(e)
             except Exception as e:
@@ -279,19 +344,28 @@ class PanelWin(object):
         self._applied = ok_any
         if ok_any:
             return True, ""
-        return False, err or "SetWindowCompositionAttribute 调用失败"
+        return False, err or "设置任务栏透明度失败"
 
     def keep_alive(self):
-        """资源管理器重启会让句柄失效，句柄变了就重新贴一次。"""
-        if not IS_WINDOWS or not self.glass_on():
+        """资源管理器重启会换句柄，另外它自己也可能把 layered 标志冲掉。"""
+        if not IS_WINDOWS:
             return
-        if tuple(_taskbars()) != self._last_hwnds:
+        hwnds = tuple(_taskbars())
+        if hwnds != self._last_hwnds:
             self.apply_glass()
+            return
+        # 句柄没变但 layered 位没了（explorer 重绘/主题切换），补一次
+        for h in hwnds:
+            try:
+                if not (_get_exstyle(h) & WS_EX_LAYERED):
+                    self.apply_glass()
+                    return
+            except Exception:
+                pass
 
     def set_glass(self, on):
         self.cfg["general"]["glass"] = "1" if on else "0"
-        if on:
-            self.apply_glass()
+        self.apply_glass()      # 开和关都要落到窗口上，否则关掉不生效
 
     # -- 兼容接口 -----------------------------------------------------------
     def pin_popups(self):
@@ -305,8 +379,20 @@ class PanelWin(object):
         return True
 
     def restore(self):
-        """还原系统外观：摘掉我们贴的 accent，并把「透明效果」写回原来的值。"""
+        """还原系统外观：任务栏回满不透明、摘掉 layered，再把「透明效果」写回原值。"""
+        for h, ex in list(self._ex_style.items()):
+            _clear_opacity(h, ex)
+        self._ex_style.clear()
+
         for h in _taskbars():
+            try:
+                # 没记录过的残留（上次异常退出留下的 layered）也一并清掉，
+                # 否则任务栏会一直挂着一个"不透明的分层窗口"状态。
+                ex = _get_exstyle(h)
+                if ex & WS_EX_LAYERED:
+                    _clear_opacity(h, ex & ~WS_EX_LAYERED)
+            except Exception:
+                pass
             try:
                 _set_accent(h, ACCENT_DISABLED, 0)
             except Exception:
