@@ -191,6 +191,8 @@ def _appbar(state=None):
 
 # 第三方任务栏美化工具和本程序改的是同一块任务栏，后写的会覆盖先写的。
 # 检测到就提示用户二选一，而不是让两个程序互相打架。
+# 这里是**进程名**（用来识别那个工具在不在跑），界面永远只显示"第三方任务栏美化工具"，
+# 不会把这些名字摆给用户看。
 _TASKBAR_TOOLS = ("TranslucentTaskbar", "TranslucentTB", "RoundedTB",
                   "ExplorerPatcher", "TaskbarX", "StartAllBack")
 
