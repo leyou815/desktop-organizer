@@ -480,7 +480,7 @@ class MainWindow(QWidget):
             self.style_chips.stylePicked.connect(self._on_style)
             lay.addWidget(self.style_chips)
 
-        # 注入全透明（Windows 独有，v1.0.6+）：真把任务栏背景摘掉，图标不受影响
+        # 注入全透明（Windows 独有）：真把任务栏背景摘掉，图标不受影响
         self.inject_row = QWidget(page)
         self.inject_row.setStyleSheet("background:transparent;")
         r1 = QHBoxLayout(self.inject_row)
